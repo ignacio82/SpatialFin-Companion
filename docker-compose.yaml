@@ -1,0 +1,14 @@
+services:
+  spatialfin-companion:
+    build: .
+    container_name: spatialfin-companion
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    ports:
+      - "1982:1982"
+    volumes:
+      - ./config.json:/app/config.json
+      - ./data:/app/data
+    restart: unless-stopped

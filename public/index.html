@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SpatialFin Companion</title>
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#00a4dc">
+    <link rel="apple-touch-icon" href="icon.png">
+    <link rel="stylesheet" href="style.css">
+
+</head>
+<body>
+    <!-- Login overlay -->
+    <div id="login-overlay" class="login-overlay" style="display:none">
+        <div class="login-box">
+            <div class="login-icon">&#128274;</div>
+            <h2>Admin Login</h2>
+            <input type="password" id="login-password" placeholder="Enter admin password" onkeydown="if(event.key==='Enter')doLogin()">
+            <button onclick="doLogin()">Login</button>
+            <p id="login-error" style="color:var(--error);font-size:0.85rem;margin-top:10px;display:none;"></p>
+        </div>
+    </div>
+
+    <!-- QR fullscreen overlay -->
+    <div id="qr-fullscreen" class="qr-fullscreen-overlay" style="display:none">
+        <img id="qr-fullscreen-image" alt="QR Code Fullscreen">
+        <button class="qr-close-btn" onclick="closeQRFullscreen()">&times;</button>
+    </div>
+
+    <!-- Toast container -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- Hamburger for tablet -->
+    <button class="hamburger" id="hamburger" onclick="toggleSidebar()">&#9776;</button>
+
+    <nav id="main-nav">
+        <div class="logo-container">
+            <img src="icon.png" alt="SpatialFin Logo">
+            <h1>SPATIALFIN</h1>
+        </div>
+        <div class="nav-link" data-section="dashboard" onclick="showSection('dashboard', this)">Dashboard</div>
+        <div class="nav-link" data-section="global-settings" onclick="showSection('global-settings', this)">Global Settings</div>
+        <div class="nav-link" data-section="external-services" onclick="showSection('external-services', this)">External Services</div>
+        <div class="nav-link" data-section="device-logs" onclick="showSection('device-logs', this)">Device Logs</div>
+        <div class="nav-link" data-section="servers" onclick="showSection('servers', this)">Servers &amp; Users</div>
+        <div class="nav-link" data-section="network-shares" onclick="showSection('network-shares', this)">Network Shares</div>
+        <div style="flex-grow: 1;"></div>
+    </nav>
+
+    <main>
+        <!-- Dashboard / Discovery -->
+        <div id="dashboard" class="section active">
+            <h2>Dashboard</h2>
+
+            <!-- Server status -->
+            <div class="card">
+                <h3>Server Status</h3>
+                <p><span class="connection-dot offline" id="server-status-dot"></span> Server: <span id="server-status-text">Checking...</span></p>
+            </div>
+
+            <!-- QR Card -->
+            <div class="card" style="text-align: center;">
+                <h3>Device Discovery</h3>
+                <p>Scan this QR code with your Galaxy XR device during setup.</p>
+                <div id="qr-display">
+                    <img id="qr-image" alt="QR Code" style="max-width:260px;">
+                </div>
+                <div style="margin-top: 15px;">
+                    <button class="secondary" onclick="showQRFullscreen()">Fullscreen</button>
+                </div>
+                <p style="margin-top: 20px; font-family: monospace; font-size: 0.8rem; color: var(--text-muted);" id="qr-payload-text"></p>
+            </div>
+
+            <!-- Setup Token -->
+            <div class="card">
+                <h3>Setup Token</h3>
+                <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <div class="token-display">
+                        <span id="token-text">&#9679;&#9679;&#9679;&#9679;&#9679;&#9679;&#9679;&#9679;</span>
+                    </div>
+                    <button class="secondary" onclick="toggleTokenVisibility()">Reveal</button>
+                    <button class="secondary" onclick="rotateToken()">Rotate</button>
+                </div>
+            </div>
+
+            <!-- Stats -->
+            <div class="card">
+                <h3>Quick Stats</h3>
+                <div class="stats-grid">
+                    <div class="stat-card" onclick="showSection('servers', document.querySelector('[data-section=servers]'))">
+                        <div class="stat-icon">&#128421;</div>
+                        <div class="stat-count" id="stat-servers">0</div>
+                        <div class="stat-label">Servers</div>
+                    </div>
+                    <div class="stat-card" onclick="showSection('servers', document.querySelector('[data-section=servers]'))">
+                        <div class="stat-icon">&#128100;</div>
+                        <div class="stat-count" id="stat-users">0</div>
+                        <div class="stat-label">Users</div>
+                    </div>
+                    <div class="stat-card" onclick="showSection('network-shares', document.querySelector('[data-section=&quot;network-shares&quot;]'))">
+                        <div class="stat-icon">&#128193;</div>
+                        <div class="stat-count" id="stat-shares">0</div>
+                        <div class="stat-label">Shares</div>
+                    </div>
+                    <div class="stat-card" onclick="showSection('device-logs', document.querySelector('[data-section=&quot;device-logs&quot;]'))">
+                        <div class="stat-icon">&#128221;</div>
+                        <div class="stat-count" id="stat-devices">0</div>
+                        <div class="stat-label">Logging Devices</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Config Management -->
+            <div class="card">
+                <h3>Config Management</h3>
+                <div style="display:flex;gap:12px;align-items:center;margin-bottom:1rem;">
+                    <button class="secondary" onclick="exportConfig()">Export Config</button>
+                </div>
+                <div class="drag-drop-zone" id="import-drop-zone">
+                    <p style="margin:0;">Drag &amp; drop a config JSON file here to import, or click to select.</p>
+                    <input type="file" id="import-file-input" accept=".json" style="display:none;" onchange="handleImportFile(this.files[0])">
+                </div>
+            </div>
+
+            <!-- Sync History -->
+            <div class="card">
+                <h3>Sync History</h3>
+                <table class="sync-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>User Agent</th>
+                            <th>IP</th>
+                        </tr>
+                    </thead>
+                    <tbody id="sync-table-body">
+                        <tr><td colspan="3" style="color:var(--text-muted);text-align:center;">Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div id="device-logs" class="section">
+            <h2>Device Logs</h2>
+            <p style="color: var(--text-muted); margin-bottom: 2rem;">When companion-managed logging is enabled, SpatialFin headsets stream new log lines here. Select a device to inspect or download its captured logs.</p>
+
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <div>
+                        <h3 style="margin-bottom:6px;">Logging Status</h3>
+                        <div class="log-meta" id="device-logs-summary">Loading device logs...</div>
+                    </div>
+                    <button class="secondary" onclick="loadDeviceLogs()">Refresh</button>
+                </div>
+            </div>
+
+            <div style="display:grid;grid-template-columns:minmax(280px, 360px) minmax(0, 1fr);gap:20px;align-items:start;">
+                <div class="card">
+                    <h3>Devices</h3>
+                    <div id="log-device-list" class="log-device-list">
+                        <div class="log-meta">Loading devices...</div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+                        <div>
+                            <h3 id="log-viewer-title">Select a device</h3>
+                            <div class="log-meta" id="log-viewer-meta">No device selected.</div>
+                        </div>
+                        <button class="danger" id="clear-logs-button" onclick="clearSelectedLogs()" disabled>Clear Logs</button>
+   <button class="secondary" id="download-logs-button" onclick="downloadSelectedLogs()" disabled>Download Logs</button>
+                    </div>
+                    <div style="display:flex;gap:10px;margin-top:16px;align-items:center;flex-wrap:wrap;">
+     <input type="text" id="log-search" placeholder="Search logs..." oninput="filterLogs()" style="flex:1;min-width:150px;">
+     <select id="log-level-filter" onchange="filterLogs()">
+       <option value="ALL">All Levels</option>
+       <option value="INFO">Info</option>
+       <option value="WARN">Warning</option>
+       <option value="ERROR">Error</option>
+     </select>
+     <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;cursor:pointer;">
+       <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
+     </label>
+   </div>
+   <div id="log-viewer" class="log-viewer" style="margin-top:10px;">Choose a device to view recent log lines.</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Global Settings -->
+        <div id="history" class="section">
+            <h2>Config History &amp; Rollback</h2>
+            <p style="color: var(--text-muted); margin-bottom: 2rem;">Restore your configuration to a previous point in time. Warning: Restoring a snapshot will immediately replace all current settings, servers, and shares.</p>
+            <div class="card">
+                <table class="sync-table">
+                    <thead>
+                        <tr>
+                            <th>Snapshot ID</th>
+                            <th>Time</th>
+                            <th>Reason</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="snapshots-table-body">
+                        <tr><td colspan="4" style="color:var(--text-muted);text-align:center;">Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div id="global-settings" class="section">
+            <h2>Global Preferences</h2>
+            <p style="color: var(--text-muted); margin-bottom: 2rem;">These settings apply to all devices and users unless overridden.</p>
+
+            <div class="card">
+                <h3>Language Behavior</h3>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Prefer Original Language</span>
+                        <span class="setting-desc">Always try to use the original audio track when available.</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="pref_smart_prefer_original_audio">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="setting-row" style="align-items: flex-start; flex-direction: column;">
+                    <div class="setting-info" style="margin-bottom: 15px;">
+                        <span class="setting-label">Spoken Languages (Priority List)</span>
+                        <span class="setting-desc">The first language in this list has the highest priority for audio tracks.</span>
+                    </div>
+
+                    <div id="spoken-langs-list" style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 15px; width: 100%;"></div>
+
+                    <div style="display: flex; gap: 10px; width: 100%;">
+                        <select id="add-lang-select" class="lang-select" style="flex-grow: 1;"></select>
+                        <button class="secondary" onclick="addSpokenLanguage()" style="padding: 8px 16px;">Add Language</button>
+                    </div>
+                    <input type="hidden" id="pref_smart_spoken_languages">
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Default Audio Language</span>
+                        <span class="setting-desc">Global fallback for audio tracks.</span>
+                    </div>
+                    <select id="pref_audio_language" class="lang-select"></select>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Default Subtitle Language</span>
+                        <span class="setting-desc">Global fallback for subtitles.</span>
+                    </div>
+                    <select id="pref_subtitle_language" class="lang-select"></select>
+                </div>
+            </div>
+
+            <!-- Anime Overrides -->
+            <div class="card">
+                <h3>Anime Overrides</h3>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Anime Audio Language</span>
+                        <span class="setting-desc">Audio language override for anime content.</span>
+                    </div>
+                    <select id="pref_anime_audio_language" class="lang-select"></select>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Anime Subtitle Language</span>
+                        <span class="setting-desc">Subtitle language override for anime content.</span>
+                    </div>
+                    <select id="pref_anime_subtitle_language" class="lang-select"></select>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Non-Anime Audio Language</span>
+                        <span class="setting-desc">Audio language override for non-anime content.</span>
+                    </div>
+                    <select id="pref_non_anime_audio_language" class="lang-select"></select>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Non-Anime Subtitle Language</span>
+                        <span class="setting-desc">Subtitle language override for non-anime content.</span>
+                    </div>
+                    <select id="pref_non_anime_subtitle_language" class="lang-select"></select>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Non-Anime Subtitles Disabled</span>
+                        <span class="setting-desc">Disable subtitles entirely for non-anime content.</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="pref_non_anime_subtitle_disabled">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Player Preferences -->
+            <div class="card">
+                <h3>Player Preferences</h3>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Seek Back Increment (ms)</span>
+                        <span class="setting-desc">Milliseconds to jump backward when seeking.</span>
+                    </div>
+                    <input type="number" id="pref_player_seek_back_inc" placeholder="10000">
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Seek Forward Increment (ms)</span>
+                        <span class="setting-desc">Milliseconds to jump forward when seeking.</span>
+                    </div>
+                    <input type="number" id="pref_player_seek_forward_inc" placeholder="30000">
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Chapter Markers</span>
+                        <span class="setting-desc">Show chapter markers on the seek bar.</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="pref_player_chapter_markers">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Trickplay</span>
+                        <span class="setting-desc">Enable trickplay thumbnail previews while seeking.</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="pref_player_trickplay">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Max Bitrate</span>
+                        <span class="setting-desc">Maximum bitrate for playback. 0 = auto.</span>
+                    </div>
+                    <input type="number" id="pref_player_max_bitrate" placeholder="0">
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Libass Subtitle Usage</span>
+                        <span class="setting-desc">When to use libass for subtitle rendering.</span>
+                    </div>
+                    <select id="pref_libass_subtitle_usage">
+                        <option value="auto">Auto</option>
+                        <option value="always">Always</option>
+                        <option value="never">Never</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Diagnostics</h3>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Enable Companion Logging</span>
+                        <span class="setting-desc">Turns on SpatialFin file logging and streams new log lines back to this companion dashboard for viewing and download.</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="pref_logging_enabled">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Voice Assistant -->
+            <div class="card">
+                <h3>Voice Assistant</h3>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Voice Control Enabled</span>
+                        <span class="setting-desc">Enable voice commands for hands-free control.</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="pref_voice_control_enabled">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Gesture Hand</span>
+                        <span class="setting-desc">Which hand to use for gesture controls.</span>
+                    </div>
+                    <select id="pref_voice_gesture_hand">
+                        <option value="left">Left</option>
+                        <option value="right">Right</option>
+                    </select>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Verbosity</span>
+                        <span class="setting-desc">How detailed the assistant responses should be.</span>
+                    </div>
+                    <select id="pref_voice_assistant_verbosity">
+                        <option value="minimal">Minimal</option>
+                        <option value="balanced">Balanced</option>
+                        <option value="verbose">Verbose</option>
+                    </select>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Spoiler Policy</span>
+                        <span class="setting-desc">How careful the assistant is about spoilers.</span>
+                    </div>
+                    <select id="pref_voice_assistant_spoiler_policy">
+                        <option value="cautious">Cautious</option>
+                        <option value="permissive">Permissive</option>
+                    </select>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Spoken Replies</span>
+                        <span class="setting-desc">Enable text-to-speech for assistant replies.</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="pref_voice_assistant_spoken_replies">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Voice</span>
+                        <span class="setting-desc">Voice type for spoken replies.</span>
+                    </div>
+                    <select id="pref_voice_assistant_voice">
+                        <option value="male">Male</option>
+                        <option value="female">Female</option>
+                    </select>
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 10px; justify-content: flex-end;">
+                <button onclick="saveGlobalSettings()">Save Global Settings</button>
+            </div>
+        </div>
+
+        <!-- External Services -->
+        <div id="external-services" class="section">
+            <h2>External Services</h2>
+            <div class="card">
+                <h3>Seerr (Overseerr / Jellyseerr)</h3>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Enable Seerr Integration</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="pref_seerr_enabled">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Seerr URL</span>
+                        <span class="setting-desc">Full URL to your Seerr instance.</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <input type="url" id="pref_seerr_url" placeholder="http://192.168.1.10:5055">
+                        <button class="secondary" onclick="testSeerr()">Test</button>
+                        <span id="seerr-test-result" class="test-result"></span>
+                    </div>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Seerr API Key</span>
+                    </div>
+                    <input type="password" id="pref_seerr_api_key">
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>TMDB &amp; AI</h3>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">TMDB API Key</span>
+                        <span class="setting-desc">Used for fetching high-quality metadata and trailers. <a href="https://www.themoviedb.org/settings/api" target="_blank" style="color: var(--primary); text-decoration: none;">[Get Key]</a></span>
+                    </div>
+                    <input type="password" id="pref_tmdb_api_key">
+                </div>
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Gemini API Key</span>
+                        <span class="setting-desc">Used for cloud AI fallback. <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color: var(--primary); text-decoration: none;">[Get Key]</a></span>
+                    </div>
+                    <input type="password" id="pref_voice_assistant_cloud_api_key">
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 10px; justify-content: flex-end;">
+                <button onclick="saveGlobalSettings()">Save External Services</button>
+            </div>
+        </div>
+
+        <!-- Servers & Users -->
+        <div id="servers" class="section">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px;">
+                <h2 style="margin: 0; border: none; padding: 0;">Jellyfin Servers</h2>
+                <button onclick="addServer()">Add Server</button>
+            </div>
+            <div id="server-container"></div>
+            <div style="display: flex; gap: 10px; justify-content: flex-end;">
+                <button onclick="saveServersData()">Save Servers</button>
+            </div>
+        </div>
+
+        <!-- Network Shares -->
+        <div id="network-shares" class="section">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px;">
+                <h2 style="margin: 0; border: none; padding: 0;">Network Shares (SMB/NFS)</h2>
+                <button onclick="addShare()">Add Share</button>
+            </div>
+            <div id="share-container"></div>
+            <div style="display: flex; gap: 10px; justify-content: flex-end;">
+                <button onclick="saveSharesData()">Save Network Shares</button>
+            </div>
+        </div>
+    </main>
+
+    <script src="app.js"></script>
+
+</body>
+</html>
