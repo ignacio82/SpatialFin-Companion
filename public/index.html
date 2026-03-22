@@ -56,6 +56,7 @@
             <h1>SPATIALFIN</h1>
         </div>
         <div class="nav-link" data-section="dashboard" onclick="showSection('dashboard', this)">Dashboard</div>
+        <div class="nav-link" data-section="analytics" onclick="showSection('analytics', this)">Analytics</div>
         <div class="nav-link" data-section="global-settings" onclick="showSection('global-settings', this)">Global Settings</div>
         <div class="nav-link" data-section="external-services" onclick="showSection('external-services', this)">External Services</div>
         <div class="nav-link" data-section="device-logs" onclick="showSection('device-logs', this)">Device Logs</div>
@@ -124,6 +125,11 @@
                         <div class="stat-count" id="stat-devices">0</div>
                         <div class="stat-label">Logging Devices</div>
                     </div>
+                    <div class="stat-card" onclick="showSection('analytics', document.querySelector('[data-section=&quot;analytics&quot;]'))">
+                        <div class="stat-icon">&#128202;</div>
+                        <div class="stat-count" id="stat-analytics-sessions">0</div>
+                        <div class="stat-label">Playback Sessions</div>
+                    </div>
                 </div>
             </div>
 
@@ -154,6 +160,173 @@
                         <tr><td colspan="3" style="color:var(--text-muted);text-align:center;">Loading...</td></tr>
                     </tbody>
                 </table>
+            </div>
+        </div>
+
+        <div id="analytics" class="section">
+            <h2>Analytics</h2>
+            <p style="color: var(--text-muted); margin-bottom: 2rem;">Playback analytics collected from trusted SpatialFin clients. This phase focuses on recent sessions, watch time, top users, and top libraries.</p>
+
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <div>
+                        <h3 style="margin-bottom:6px;">Automatic Jellyfin Sync</h3>
+                        <div class="analytics-detail-meta" id="analytics-sync-status">Checking analytics sync status...</div>
+                    </div>
+                    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+                        <select id="analytics-range-days" onchange="changeAnalyticsRange()">
+                            <option value="7">Last 7 days</option>
+                            <option value="30" selected>Last 30 days</option>
+                            <option value="90">Last 90 days</option>
+                            <option value="180">Last 180 days</option>
+                            <option value="365">Last 365 days</option>
+                        </select>
+                        <button class="secondary" onclick="triggerAnalyticsSync()">Sync Now</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <div>
+                        <h3 style="margin-bottom:6px;">Realtime Socket Health</h3>
+                        <div class="log-meta">Live Jellyfin websocket connection status for each verified server/user pair.</div>
+                    </div>
+                </div>
+                <div id="analytics-realtime-sockets" class="analytics-realtime-sockets">
+                    <div class="log-meta">Loading realtime socket status...</div>
+                </div>
+            </div>
+
+            <div class="analytics-metric-grid">
+                <div class="analytics-metric-card">
+                    <div class="analytics-metric-label">Sessions</div>
+                    <div class="analytics-metric-value" id="analytics-total-sessions">0</div>
+                    <div class="analytics-metric-meta" id="analytics-last-session">No sessions yet</div>
+                </div>
+                <div class="analytics-metric-card">
+                    <div class="analytics-metric-label">Watch Time</div>
+                    <div class="analytics-metric-value" id="analytics-watch-time">0m</div>
+                    <div class="analytics-metric-meta" id="analytics-completion-rate">Completion rate: 0%</div>
+                </div>
+                <div class="analytics-metric-card">
+                    <div class="analytics-metric-label">Coverage</div>
+                    <div class="analytics-metric-value" id="analytics-unique-users">0 users</div>
+                    <div class="analytics-metric-meta" id="analytics-unique-footprint">0 servers • 0 libraries • 0 items • 0 devices</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <div>
+                        <h3 style="margin-bottom:6px;">Daily Watch Trend</h3>
+                        <div class="log-meta">Recent daily watch time and session volume.</div>
+                    </div>
+                </div>
+                <div id="analytics-trend-chart" class="analytics-trend-chart">
+                    <div class="log-meta">Loading daily trends...</div>
+                </div>
+                <div id="analytics-trend-summary" class="analytics-chart-summary">
+                    <div class="log-meta">Preparing trend summary...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <div>
+                        <h3 style="margin-bottom:6px;">Recent Playback Sessions</h3>
+                        <div class="log-meta">Select a session to inspect its playback timeline and metadata.</div>
+                    </div>
+                    <button class="secondary" onclick="loadAnalyticsOverview(true)">Refresh</button>
+                </div>
+                <div class="analytics-two-column">
+                    <div>
+                        <div id="analytics-session-list" class="analytics-session-list">
+                            <div class="log-meta">Loading analytics sessions...</div>
+                        </div>
+                    </div>
+                    <div class="analytics-detail-card">
+                        <h3 id="analytics-detail-title">Select a playback session</h3>
+                        <div class="analytics-detail-meta" id="analytics-detail-meta">No playback session selected.</div>
+                        <div id="analytics-detail-summary" class="analytics-detail-summary"></div>
+                        <div id="analytics-events" class="analytics-events">
+                            <div class="log-meta">Choose a playback session to inspect its event timeline.</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="analytics-split-grid">
+                <div class="card">
+                    <h3>Top Servers</h3>
+                    <div id="analytics-top-servers" class="analytics-ranking-list">
+                        <div class="log-meta">Loading server analytics...</div>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>Top Users</h3>
+                    <div id="analytics-top-users" class="analytics-ranking-list">
+                        <div class="log-meta">Loading user analytics...</div>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>Top Libraries</h3>
+                    <div id="analytics-top-libraries" class="analytics-ranking-list">
+                        <div class="log-meta">Loading library analytics...</div>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>Top Items</h3>
+                    <div id="analytics-top-items" class="analytics-ranking-list">
+                        <div class="log-meta">Loading item analytics...</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <div>
+                        <h3 style="margin-bottom:6px;">Watch History</h3>
+                        <div class="log-meta">Recent playback sessions with optional user and title filtering.</div>
+                    </div>
+                    <button class="secondary" onclick="loadWatchHistory()">Refresh History</button>
+                </div>
+                <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:16px;">
+                    <input type="text" id="analytics-history-user-filter" placeholder="Filter by user" style="min-width:200px;">
+                    <input type="text" id="analytics-history-item-filter" placeholder="Filter by title or item ID" style="min-width:240px;">
+                    <button class="secondary" onclick="loadWatchHistory()">Apply Filters</button>
+                </div>
+                <div class="analytics-history-wrap">
+                    <table class="sync-table analytics-history-table">
+                        <thead>
+                            <tr>
+                                <th>Last Seen</th>
+                                <th>Title</th>
+                                <th>User</th>
+                                <th>Library</th>
+                                <th>Watch Time</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="analytics-history-body">
+                            <tr><td colspan="6" style="color:var(--text-muted);text-align:center;">Loading watch history...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <div>
+                        <h3 id="analytics-entity-title" style="margin-bottom:6px;">Detail Drilldown</h3>
+                        <div class="analytics-detail-meta" id="analytics-entity-meta">Select a user or item from the rankings or watch history.</div>
+                    </div>
+                    <button class="secondary" onclick="clearAnalyticsEntityDetail()">Clear</button>
+                </div>
+                <div id="analytics-entity-summary" class="analytics-detail-summary"></div>
+                <div id="analytics-entity-history" class="analytics-entity-history">
+                    <div class="log-meta">No drilldown selected.</div>
+                </div>
             </div>
         </div>
 

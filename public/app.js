@@ -2,7 +2,20 @@ const ALL_LANGS = {"abk":"Abkhazian","aar":"Afar","afr":"Afrikaans","aka":"Akan"
 
         let configData = null;
         let logSummary = { loggingEnabled: false, devices: [] };
+        let analyticsRangeDays = 30;
+        let analyticsSummary = {
+            overview: null,
+            realtimeSockets: [],
+            recentSessions: [],
+            topServers: [],
+            topUsers: [],
+            topLibraries: [],
+            trends: [],
+            topItems: []
+        };
+        let selectedAnalyticsEntity = null;
         let selectedLogDeviceId = null;
+        let selectedAnalyticsSessionId = null;
 let currentDeviceLogs = [];
 let autoScrollEnabled = true;
         let spokenLanguages = [];
@@ -173,6 +186,7 @@ let autoScrollEnabled = true;
             if (overlay && overlay.classList.contains('open')) overlay.classList.remove('open');
             
             if (id === 'device-logs') loadDeviceLogs();
+            if (id === 'analytics') loadAnalyticsOverview(true);
             if (id === 'history') loadSnapshots();
         }
 
@@ -245,6 +259,9 @@ let autoScrollEnabled = true;
             document.getElementById('stat-users').innerText = userCount;
             document.getElementById('stat-shares').innerText = configData.networkShares.length;
             document.getElementById('stat-devices').innerText = (logSummary.devices || []).length;
+            var sessionCount = analyticsSummary.overview && analyticsSummary.overview.totalSessions ? analyticsSummary.overview.totalSessions : 0;
+            var analyticsEl = document.getElementById('stat-analytics-sessions');
+            if (analyticsEl) analyticsEl.innerText = sessionCount;
         }
 
         // ── Server status heartbeat ──
@@ -434,6 +451,591 @@ let autoScrollEnabled = true;
                 .replace(/>/g, '&gt;')
                 .replace(/"/g, '&quot;')
                 .replace(/'/g, '&#39;');
+        }
+
+        function formatDurationMs(totalMs) {
+            var ms = Number(totalMs) || 0;
+            if (ms <= 0) return '0m';
+            var totalSeconds = Math.round(ms / 1000);
+            var hours = Math.floor(totalSeconds / 3600);
+            var minutes = Math.floor((totalSeconds % 3600) / 60);
+            if (hours > 0) return hours + 'h ' + minutes + 'm';
+            return Math.max(1, minutes) + 'm';
+        }
+
+        function formatPercent(value) {
+            var num = Number(value) || 0;
+            return (num * 100).toFixed(1).replace(/\.0$/, '') + '%';
+        }
+
+        function formatTicks(ticks) {
+            if (ticks == null) return 'Unknown';
+            var totalSeconds = Math.round((Number(ticks) || 0) / 10000000);
+            var hours = Math.floor(totalSeconds / 3600);
+            var minutes = Math.floor((totalSeconds % 3600) / 60);
+            var seconds = totalSeconds % 60;
+            if (hours > 0) return hours + 'h ' + minutes + 'm ' + seconds + 's';
+            if (minutes > 0) return minutes + 'm ' + seconds + 's';
+            return seconds + 's';
+        }
+
+        function formatMetadataRuntime(metadata, fallbackTicks) {
+            var ticks = metadata && metadata.runtimeTicks != null ? metadata.runtimeTicks : fallbackTicks;
+            if (ticks == null) return 'Unknown runtime';
+            return formatTicks(ticks);
+        }
+
+        function buildArtworkUrl(metadata) {
+            if (!metadata || !metadata.serverId || !metadata.itemId || !metadata.primaryImageTag) return '';
+            return '/api/admin/analytics/artwork/' + encodeURIComponent(metadata.serverId) + '/' + encodeURIComponent(metadata.itemId);
+        }
+
+        function buildMetadataLine(metadata) {
+            if (!metadata) return '';
+            var parts = [];
+            if (metadata.seriesName) parts.push(metadata.seriesName);
+            if (metadata.seasonName) parts.push(metadata.seasonName);
+            if (metadata.productionYear) parts.push(String(metadata.productionYear));
+            if (metadata.officialRating) parts.push(metadata.officialRating);
+            if (Array.isArray(metadata.genres) && metadata.genres.length) parts.push(metadata.genres.slice(0, 2).join(', '));
+            return parts.join(' • ');
+        }
+
+        function svgEscape(value) {
+            return String(value || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function createSparkBar(value, maxValue, toneClass) {
+            var width = maxValue > 0 ? Math.max(10, Math.round((value / maxValue) * 100)) : 10;
+            var fillClass = 'analytics-bar-fill' + (toneClass ? ' ' + toneClass : '');
+            return '<div class="analytics-bar-track"><div class="' + fillClass + '" style="width:' + width + '%;"></div></div>';
+        }
+
+        function analyticsEntityButton(type, ref, label) {
+            var encodedType = encodeURIComponent(type);
+            var encodedRef = encodeURIComponent(ref || '');
+            return '<button type="button" class="analytics-inline-link" onclick="loadAnalyticsEntityDetail(decodeURIComponent(\'' + encodedType + '\'), decodeURIComponent(\'' + encodedRef + '\'))">' + escapeHtml(label) + '</button>';
+        }
+
+        function analyticsSessionLabel(session) {
+            var parts = [];
+            if (session.username) parts.push(session.username);
+            if (session.serverName) parts.push(session.serverName);
+            if (session.deviceId) parts.push(session.deviceId);
+            return parts.join(' • ') || 'Unknown playback context';
+        }
+
+        function renderAnalyticsOverview() {
+            var overview = analyticsSummary.overview || {
+                totalSessions: 0,
+                totalPlayDurationMs: 0,
+                uniqueUsers: 0,
+                uniqueLibraries: 0,
+                uniqueItems: 0,
+                uniqueDevices: 0,
+                completionRate: 0,
+                lastSessionAt: null
+            };
+            document.getElementById('analytics-total-sessions').textContent = String(overview.totalSessions || 0);
+            document.getElementById('analytics-watch-time').textContent = formatDurationMs(overview.totalPlayDurationMs);
+            document.getElementById('analytics-unique-users').textContent = String(overview.uniqueUsers || 0) + ' users';
+            document.getElementById('analytics-completion-rate').textContent = 'Completion rate: ' + formatPercent(overview.completionRate || 0);
+            document.getElementById('analytics-last-session').textContent = overview.lastSessionAt
+                ? 'Last session: ' + new Date(overview.lastSessionAt).toLocaleString()
+                : 'No sessions yet';
+            var activeServers = analyticsSummary.topServers || [];
+            document.getElementById('analytics-unique-footprint').textContent =
+                String(activeServers.length || 0) + ' servers • ' +
+                String(overview.uniqueLibraries || 0) + ' libraries • ' +
+                String(overview.uniqueItems || 0) + ' items • ' +
+                String(overview.uniqueDevices || 0) + ' devices';
+            var rangeEl = document.getElementById('analytics-range-days');
+            if (rangeEl) rangeEl.value = String(analyticsRangeDays);
+            renderAnalyticsSyncStatus();
+            updateStats();
+        }
+
+        function renderAnalyticsSyncStatus() {
+            var sync = analyticsSummary.sync || {};
+            var parts = [];
+            if (sync.running) {
+                parts.push('Sync in progress');
+            } else {
+                parts.push('Idle');
+            }
+            if (sync.lastSuccessAt) {
+                parts.push('Last success ' + new Date(sync.lastSuccessAt).toLocaleString());
+            }
+            if (sync.lastRunAt) {
+                parts.push('Last run ' + new Date(sync.lastRunAt).toLocaleString());
+            }
+            if (typeof sync.polledServers === 'number' || typeof sync.polledUsers === 'number') {
+                parts.push(String(sync.polledServers || 0) + ' servers • ' + String(sync.polledUsers || 0) + ' users');
+            }
+            if (typeof sync.websocketConfigured === 'number' || typeof sync.websocketConnected === 'number') {
+                parts.push(String(sync.websocketConnected || 0) + '/' + String(sync.websocketConfigured || 0) + ' realtime sockets');
+            }
+            if (typeof sync.accepted === 'number' || typeof sync.closed === 'number') {
+                parts.push(String(sync.accepted || 0) + ' active updates • ' + String(sync.closed || 0) + ' closed');
+            }
+            if (sync.websocketLastMessageAt) {
+                parts.push('Realtime last message ' + new Date(sync.websocketLastMessageAt).toLocaleString());
+            }
+            if (sync.lastError) {
+                parts.push('Last error: ' + sync.lastError);
+            }
+            var el = document.getElementById('analytics-sync-status');
+            if (el) {
+                el.textContent = parts.join(' • ') || 'No analytics sync has run yet.';
+            }
+        }
+
+        function renderRealtimeSocketStatus() {
+            var socketsEl = document.getElementById('analytics-realtime-sockets');
+            if (!socketsEl) return;
+            var sockets = analyticsSummary.realtimeSockets || [];
+            if (!sockets.length) {
+                socketsEl.innerHTML = '<div class="log-meta">No realtime Jellyfin sockets are configured yet. Verify a Jellyfin user to enable live ingestion.</div>';
+                return;
+            }
+            socketsEl.innerHTML = sockets.map(function(socket) {
+                var stateClass = socket.connected ? 'connected' : (socket.state === 'reconnecting' ? 'reconnecting' : 'disconnected');
+                var meta = [];
+                meta.push(socket.username || 'Unknown user');
+                if (socket.messageCount || socket.messageCount === 0) meta.push(String(socket.messageCount) + ' messages');
+                if (socket.lastMessageAt) meta.push('Last message ' + new Date(socket.lastMessageAt).toLocaleString());
+                if (socket.nextReconnectAt) meta.push('Retry ' + new Date(socket.nextReconnectAt).toLocaleString());
+                if (socket.lastError) meta.push('Error: ' + socket.lastError);
+                return '<div class="analytics-realtime-item">' +
+                    '<div class="analytics-realtime-header">' +
+                        '<div>' +
+                            '<div class="analytics-ranking-title">' + escapeHtml(socket.serverName || socket.serverId || 'Unknown Server') + '</div>' +
+                            '<div class="analytics-ranking-meta">' + escapeHtml(meta.join(' • ')) + '</div>' +
+                        '</div>' +
+                        '<div class="analytics-realtime-state ' + stateClass + '">' + escapeHtml(socket.state || 'unknown') + '</div>' +
+                    '</div>' +
+                '</div>';
+            }).join('');
+        }
+
+        function renderAnalyticsRankings() {
+            var serverEl = document.getElementById('analytics-top-servers');
+            var userEl = document.getElementById('analytics-top-users');
+            var libraryEl = document.getElementById('analytics-top-libraries');
+            var itemsEl = document.getElementById('analytics-top-items');
+            var servers = analyticsSummary.topServers || [];
+            var users = analyticsSummary.topUsers || [];
+            var libraries = analyticsSummary.topLibraries || [];
+            var items = analyticsSummary.topItems || [];
+            var maxServerDuration = servers.reduce(function(max, server) { return Math.max(max, Number(server.totalPlayDurationMs) || 0); }, 0);
+            var maxUserDuration = users.reduce(function(max, user) { return Math.max(max, Number(user.totalPlayDurationMs) || 0); }, 0);
+            var maxLibraryDuration = libraries.reduce(function(max, library) { return Math.max(max, Number(library.totalPlayDurationMs) || 0); }, 0);
+            var maxItemDuration = items.reduce(function(max, item) { return Math.max(max, Number(item.totalPlayDurationMs) || 0); }, 0);
+
+            if (!servers.length) {
+                serverEl.innerHTML = '<div class="log-meta">No server analytics yet.</div>';
+            } else {
+                serverEl.innerHTML = servers.map(function(server, index) {
+                    return '<div class="analytics-ranking-item">' +
+                        '<div class="analytics-ranking-main">' +
+                            '<div class="analytics-ranking-title">#' + (index + 1) + ' ' + escapeHtml(server.serverName || server.serverId || 'Unknown Server') + '</div>' +
+                            '<div class="analytics-ranking-meta">Users: ' + escapeHtml(String(server.uniqueUsers || 0)) + ' • Libraries: ' + escapeHtml(String(server.uniqueLibraries || 0)) + ' • Items: ' + escapeHtml(String(server.uniqueItems || 0)) + '</div>' +
+                            createSparkBar(Number(server.totalPlayDurationMs) || 0, maxServerDuration, 'analytics-bar-fill-server') +
+                        '</div>' +
+                        '<div class="analytics-ranking-value">' + escapeHtml(formatDurationMs(server.totalPlayDurationMs)) + '</div>' +
+                    '</div>';
+                }).join('');
+            }
+
+            if (!users.length) {
+                userEl.innerHTML = '<div class="log-meta">No user analytics yet.</div>';
+            } else {
+                userEl.innerHTML = users.map(function(user, index) {
+                    return '<div class="analytics-ranking-item">' +
+                        '<div class="analytics-ranking-main">' +
+                            '<div class="analytics-ranking-title">#' + (index + 1) + ' ' + analyticsEntityButton('user', user.userId || user.username, user.username || user.userId || 'Unknown User') + '</div>' +
+                            '<div class="analytics-ranking-meta">Sessions: ' + escapeHtml(String(user.sessionCount || 0)) + ' • Last seen: ' + escapeHtml(user.lastSessionAt ? new Date(user.lastSessionAt).toLocaleString() : 'Unknown') + '</div>' +
+                            createSparkBar(Number(user.totalPlayDurationMs) || 0, maxUserDuration, 'analytics-bar-fill-user') +
+                        '</div>' +
+                        '<div class="analytics-ranking-value">' + escapeHtml(formatDurationMs(user.totalPlayDurationMs)) + '</div>' +
+                    '</div>';
+                }).join('');
+            }
+
+            if (!libraries.length) {
+                libraryEl.innerHTML = '<div class="log-meta">No library analytics yet.</div>';
+            } else {
+                libraryEl.innerHTML = libraries.map(function(library, index) {
+                    return '<div class="analytics-ranking-item">' +
+                        '<div class="analytics-ranking-main">' +
+                            '<div class="analytics-ranking-title">#' + (index + 1) + ' ' + escapeHtml(library.libraryName || library.libraryId || 'Unknown Library') + '</div>' +
+                            '<div class="analytics-ranking-meta">Sessions: ' + escapeHtml(String(library.sessionCount || 0)) + ' • Items: ' + escapeHtml(String(library.uniqueItems || 0)) + '</div>' +
+                            createSparkBar(Number(library.totalPlayDurationMs) || 0, maxLibraryDuration, 'analytics-bar-fill-library') +
+                        '</div>' +
+                        '<div class="analytics-ranking-value">' + escapeHtml(formatDurationMs(library.totalPlayDurationMs)) + '</div>' +
+                    '</div>';
+                }).join('');
+            }
+
+            if (!items.length) {
+                itemsEl.innerHTML = '<div class="log-meta">No item analytics yet.</div>';
+            } else {
+                itemsEl.innerHTML = items.map(function(item, index) {
+                    var itemMeta = item.itemMetadata || null;
+                    var extraMeta = buildMetadataLine(itemMeta);
+                    return '<div class="analytics-ranking-item">' +
+                        '<div class="analytics-ranking-main">' +
+                            '<div class="analytics-ranking-title">#' + (index + 1) + ' ' + analyticsEntityButton('item', item.itemId || item.itemName, item.itemName || item.itemId || 'Unknown Item') + '</div>' +
+                            '<div class="analytics-ranking-meta">' + escapeHtml(item.itemType || 'Unknown Type') + ' • Sessions: ' + escapeHtml(String(item.sessionCount || 0)) + ' • Users: ' + escapeHtml(String(item.uniqueUsers || 0)) + (extraMeta ? ' • ' + escapeHtml(extraMeta) : '') + '</div>' +
+                            createSparkBar(Number(item.totalPlayDurationMs) || 0, maxItemDuration, 'analytics-bar-fill-item') +
+                        '</div>' +
+                        '<div class="analytics-ranking-value">' + escapeHtml(formatDurationMs(item.totalPlayDurationMs)) + '</div>' +
+                    '</div>';
+                }).join('');
+            }
+        }
+
+        function renderAnalyticsTrends() {
+            var trendEl = document.getElementById('analytics-trend-chart');
+            var summaryEl = document.getElementById('analytics-trend-summary');
+            var trends = analyticsSummary.trends || [];
+            if (!trends.length) {
+                trendEl.innerHTML = '<div class="log-meta">No daily trend data yet.</div>';
+                if (summaryEl) {
+                    summaryEl.innerHTML = '<div class="log-meta">Trend summary will appear after analytics data is collected.</div>';
+                }
+                return;
+            }
+            var width = 720;
+            var height = 240;
+            var paddingLeft = 46;
+            var paddingRight = 18;
+            var paddingTop = 18;
+            var paddingBottom = 42;
+            var innerWidth = width - paddingLeft - paddingRight;
+            var innerHeight = height - paddingTop - paddingBottom;
+            var maxDuration = trends.reduce(function(max, day) { return Math.max(max, Number(day.totalPlayDurationMs) || 0); }, 0) || 1;
+            var maxSessions = trends.reduce(function(max, day) { return Math.max(max, Number(day.sessionCount) || 0); }, 0) || 1;
+            var totalDuration = trends.reduce(function(total, day) { return total + (Number(day.totalPlayDurationMs) || 0); }, 0);
+            var totalSessions = trends.reduce(function(total, day) { return total + (Number(day.sessionCount) || 0); }, 0);
+            var busiestDay = trends.reduce(function(best, day) {
+                if (!best || (Number(day.totalPlayDurationMs) || 0) > (Number(best.totalPlayDurationMs) || 0)) return day;
+                return best;
+            }, null);
+            var stepX = trends.length > 1 ? innerWidth / (trends.length - 1) : innerWidth / 2;
+            var durationPoints = [];
+            var sessionBars = [];
+            var labels = [];
+
+            trends.forEach(function(day, index) {
+                var x = paddingLeft + (trends.length > 1 ? stepX * index : innerWidth / 2);
+                var durationValue = Number(day.totalPlayDurationMs) || 0;
+                var sessionValue = Number(day.sessionCount) || 0;
+                var y = paddingTop + innerHeight - ((durationValue / maxDuration) * innerHeight);
+                var barHeight = Math.max(4, Math.round((sessionValue / maxSessions) * innerHeight * 0.38));
+                durationPoints.push(x.toFixed(2) + ',' + y.toFixed(2));
+                sessionBars.push(
+                    '<rect x="' + (x - 10).toFixed(2) + '" y="' + (paddingTop + innerHeight - barHeight).toFixed(2) + '" width="20" height="' + barHeight.toFixed(2) + '" rx="6" class="analytics-chart-bar">' +
+                        '<title>' + svgEscape(day.day + ': ' + formatDurationMs(durationValue) + ', ' + sessionValue + ' sessions') + '</title>' +
+                    '</rect>'
+                );
+                labels.push(
+                    '<text x="' + x.toFixed(2) + '" y="' + (height - 16) + '" text-anchor="middle" class="analytics-chart-label">' + svgEscape(day.day.slice(5)) + '</text>'
+                );
+            });
+
+            var areaPoints = durationPoints.slice();
+            areaPoints.unshift(paddingLeft + ',' + (paddingTop + innerHeight));
+            areaPoints.push((paddingLeft + innerWidth) + ',' + (paddingTop + innerHeight));
+
+            var yTicks = [0, 0.5, 1].map(function(ratio) {
+                var y = paddingTop + innerHeight - (ratio * innerHeight);
+                var value = formatDurationMs(maxDuration * ratio);
+                return (
+                    '<line x1="' + paddingLeft + '" y1="' + y.toFixed(2) + '" x2="' + (paddingLeft + innerWidth) + '" y2="' + y.toFixed(2) + '" class="analytics-chart-grid"></line>' +
+                    '<text x="' + (paddingLeft - 8) + '" y="' + (y + 4).toFixed(2) + '" text-anchor="end" class="analytics-chart-axis">' + svgEscape(value) + '</text>'
+                );
+            }).join('');
+
+            trendEl.innerHTML =
+                '<div class="analytics-chart-shell">' +
+                    '<div class="analytics-chart-legend">' +
+                        '<span><span class="analytics-legend-swatch analytics-legend-watch"></span>Watch Time</span>' +
+                        '<span><span class="analytics-legend-swatch analytics-legend-session"></span>Sessions</span>' +
+                    '</div>' +
+                    '<svg viewBox="0 0 ' + width + ' ' + height + '" class="analytics-chart-svg" role="img" aria-label="Daily watch trend chart">' +
+                        yTicks +
+                        sessionBars.join('') +
+                        '<polygon points="' + areaPoints.join(' ') + '" class="analytics-chart-area"></polygon>' +
+                        '<polyline points="' + durationPoints.join(' ') + '" class="analytics-chart-line"></polyline>' +
+                        durationPoints.map(function(point, index) {
+                            var coords = point.split(',');
+                            var label = trends[index].day + ': ' + formatDurationMs(trends[index].totalPlayDurationMs) + ', ' + trends[index].sessionCount + ' sessions';
+                            return '<circle cx="' + coords[0] + '" cy="' + coords[1] + '" r="4.5" class="analytics-chart-point"><title>' + svgEscape(label) + '</title></circle>';
+                        }).join('') +
+                        labels.join('') +
+                    '</svg>' +
+                '</div>';
+            if (summaryEl) {
+                summaryEl.innerHTML =
+                    '<div class="analytics-chart-summary-card">' +
+                        '<div class="analytics-chart-summary-label">Range Watch Time</div>' +
+                        '<div class="analytics-chart-summary-value">' + escapeHtml(formatDurationMs(totalDuration)) + '</div>' +
+                        '<div class="analytics-chart-summary-meta">' + escapeHtml(String(totalSessions)) + ' sessions across ' + escapeHtml(String(trends.length)) + ' days</div>' +
+                    '</div>' +
+                    '<div class="analytics-chart-summary-card">' +
+                        '<div class="analytics-chart-summary-label">Busiest Day</div>' +
+                        '<div class="analytics-chart-summary-value">' + escapeHtml(busiestDay ? busiestDay.day : 'Unknown') + '</div>' +
+                        '<div class="analytics-chart-summary-meta">' + escapeHtml(busiestDay ? formatDurationMs(busiestDay.totalPlayDurationMs) + ' • ' + String(busiestDay.sessionCount || 0) + ' sessions' : 'No data') + '</div>' +
+                    '</div>' +
+                    '<div class="analytics-chart-summary-card">' +
+                        '<div class="analytics-chart-summary-label">Daily Average</div>' +
+                        '<div class="analytics-chart-summary-value">' + escapeHtml(formatDurationMs(Math.round(totalDuration / Math.max(1, trends.length)))) + '</div>' +
+                        '<div class="analytics-chart-summary-meta">' + escapeHtml((totalSessions / Math.max(1, trends.length)).toFixed(1).replace(/\.0$/, '')) + ' sessions per day</div>' +
+                    '</div>';
+            }
+        }
+
+        function renderAnalyticsSessions() {
+            var listEl = document.getElementById('analytics-session-list');
+            var sessions = analyticsSummary.recentSessions || [];
+            if (!sessions.length) {
+                listEl.innerHTML = '<div class="log-meta">No analytics sessions have been ingested yet.</div>';
+                if (!selectedAnalyticsSessionId) {
+                    document.getElementById('analytics-detail-title').textContent = 'No playback session selected';
+                    document.getElementById('analytics-detail-meta').textContent = 'Waiting for analytics data.';
+                    document.getElementById('analytics-detail-summary').innerHTML = '';
+                    document.getElementById('analytics-events').innerHTML = '<div class="log-meta">No playback events to display yet.</div>';
+                }
+                return;
+            }
+
+            if (!selectedAnalyticsSessionId || !sessions.some(function(session) { return session.playbackSessionId === selectedAnalyticsSessionId; })) {
+                selectedAnalyticsSessionId = sessions[0].playbackSessionId;
+            }
+
+            listEl.innerHTML = sessions.map(function(session) {
+                var active = session.playbackSessionId === selectedAnalyticsSessionId ? ' active' : '';
+                var encodedId = encodeURIComponent(session.playbackSessionId);
+                return '<button type="button" class="analytics-session-item' + active + '" onclick="selectAnalyticsSession(decodeURIComponent(\'' + encodedId + '\'))">' +
+                    '<div class="analytics-session-title">' + escapeHtml(session.itemName || 'Unknown Item') + '</div>' +
+                    '<div class="analytics-session-meta">' + escapeHtml(analyticsSessionLabel(session)) + '</div>' +
+                    '<div class="analytics-session-meta">Watch time: ' + escapeHtml(formatDurationMs(session.playDurationMs)) + ' • Last seen: ' + escapeHtml(session.lastSeenAt ? new Date(session.lastSeenAt).toLocaleString() : 'Unknown') + '</div>' +
+                '</button>';
+            }).join('');
+        }
+
+        async function loadAnalyticsOverview(forceDetailRefresh) {
+            try {
+                var res = await fetch('/api/admin/analytics/overview?recentLimit=20&topLimit=8&trendLimit=14&days=' + encodeURIComponent(analyticsRangeDays));
+                if (!res.ok) throw new Error('Unable to load analytics');
+                var data = await res.json();
+                analyticsRangeDays = Number(data.rangeDays) || analyticsRangeDays;
+                analyticsSummary = {
+                    sync: data.sync || null,
+                    overview: data.overview || null,
+                    realtimeSockets: Array.isArray(data.realtimeSockets) ? data.realtimeSockets : [],
+                    recentSessions: Array.isArray(data.recentSessions) ? data.recentSessions : [],
+                    topServers: Array.isArray(data.topServers) ? data.topServers : [],
+                    topUsers: Array.isArray(data.topUsers) ? data.topUsers : [],
+                    topLibraries: Array.isArray(data.topLibraries) ? data.topLibraries : [],
+                    trends: Array.isArray(data.trends) ? data.trends : [],
+                    topItems: Array.isArray(data.topItems) ? data.topItems : []
+                };
+                renderAnalyticsOverview();
+                renderRealtimeSocketStatus();
+                renderAnalyticsRankings();
+                renderAnalyticsTrends();
+                renderAnalyticsSessions();
+                if (selectedAnalyticsSessionId && forceDetailRefresh !== false) {
+                    await selectAnalyticsSession(selectedAnalyticsSessionId);
+                }
+            } catch (e) {
+                document.getElementById('analytics-realtime-sockets').innerHTML = '<div class="log-meta">Could not load realtime socket status.</div>';
+                document.getElementById('analytics-session-list').innerHTML = '<div class="log-meta">Could not load analytics sessions.</div>';
+                document.getElementById('analytics-top-servers').innerHTML = '<div class="log-meta">Could not load server analytics.</div>';
+                document.getElementById('analytics-top-users').innerHTML = '<div class="log-meta">Could not load user analytics.</div>';
+                document.getElementById('analytics-top-libraries').innerHTML = '<div class="log-meta">Could not load library analytics.</div>';
+                document.getElementById('analytics-top-items').innerHTML = '<div class="log-meta">Could not load item analytics.</div>';
+            }
+        }
+
+        async function selectAnalyticsSession(playbackSessionId) {
+            selectedAnalyticsSessionId = playbackSessionId;
+            renderAnalyticsSessions();
+            try {
+                var res = await fetch('/api/admin/analytics/sessions/' + encodeURIComponent(playbackSessionId) + '?limit=200');
+                if (!res.ok) throw new Error('Unable to load analytics session');
+                var data = await res.json();
+                var session = data.session || {};
+                var sessionMetadata = session.itemMetadata || null;
+                var events = Array.isArray(data.events) ? data.events : [];
+                document.getElementById('analytics-detail-title').textContent = session.itemName || 'Unknown Item';
+                document.getElementById('analytics-detail-meta').textContent = analyticsSessionLabel(session) + (sessionMetadata ? ' • ' + buildMetadataLine(sessionMetadata) : '');
+                document.getElementById('analytics-detail-summary').innerHTML =
+                    (sessionMetadata && sessionMetadata.primaryImageTag ? '<div class="analytics-media-hero"><img class="analytics-media-poster" src="' + buildArtworkUrl(sessionMetadata) + '" alt="' + escapeHtml(session.itemName || 'Item poster') + '"><div class="analytics-media-copy">' +
+                    '<div class="analytics-media-overview">' + escapeHtml(sessionMetadata.overview || 'No overview available.') + '</div>' +
+                    '</div></div>' : '') +
+                    '<div class="analytics-detail-pill">Type: ' + escapeHtml(session.itemType || 'Unknown') + '</div>' +
+                    '<div class="analytics-detail-pill">Method: ' + escapeHtml(session.playbackMethod || 'Unknown') + '</div>' +
+                    '<div class="analytics-detail-pill">Watch Time: ' + escapeHtml(formatDurationMs(session.playDurationMs)) + '</div>' +
+                    '<div class="analytics-detail-pill">Position: ' + escapeHtml(formatTicks(session.positionTicks)) + '</div>' +
+                    '<div class="analytics-detail-pill">Runtime: ' + escapeHtml(formatMetadataRuntime(sessionMetadata, session.runtimeTicks)) + '</div>' +
+                    '<div class="analytics-detail-pill">Completed: ' + escapeHtml(session.completed ? 'Yes' : 'No') + '</div>';
+
+                if (!events.length) {
+                    document.getElementById('analytics-events').innerHTML = '<div class="log-meta">No event timeline recorded for this session yet.</div>';
+                    return;
+                }
+
+                document.getElementById('analytics-events').innerHTML = events.map(function(event) {
+                    var detailParts = [];
+                    var details = event.details || {};
+                    Object.keys(details).slice(0, 4).forEach(function(key) {
+                        detailParts.push(escapeHtml(key) + ': ' + escapeHtml(details[key]));
+                    });
+                    return '<div class="analytics-event-row">' +
+                        '<div class="analytics-event-header">' +
+                            '<span class="analytics-event-type">' + escapeHtml(event.eventType || 'progress') + '</span>' +
+                            '<span class="analytics-event-time">' + escapeHtml(event.createdAt ? new Date(event.createdAt).toLocaleString() : 'Unknown') + '</span>' +
+                        '</div>' +
+                        '<div class="analytics-event-body">Position: ' + escapeHtml(formatTicks(event.positionTicks)) + (detailParts.length ? ' • ' + detailParts.join(' • ') : '') + '</div>' +
+                    '</div>';
+                }).join('');
+            } catch (e) {
+                document.getElementById('analytics-detail-title').textContent = 'Could not load session details';
+                document.getElementById('analytics-detail-meta').textContent = playbackSessionId;
+                document.getElementById('analytics-detail-summary').innerHTML = '';
+                document.getElementById('analytics-events').innerHTML = '<div class="log-meta">Failed to load playback session details.</div>';
+            }
+        }
+
+        async function triggerAnalyticsSync() {
+            try {
+                var res = await fetch('/api/admin/analytics/sync-now', { method: 'POST' });
+                var data = await res.json();
+                if (!res.ok || data.success === false) {
+                    throw new Error((data && data.error) || 'Analytics sync failed');
+                }
+                showToast(data.skipped ? 'Analytics sync already running' : 'Analytics sync started', 'success');
+                analyticsSummary.sync = data.sync || analyticsSummary.sync;
+                renderAnalyticsSyncStatus();
+                setTimeout(function() { loadAnalyticsOverview(true); }, 1200);
+            } catch (e) {
+                showToast('Analytics sync failed: ' + e.message, 'error');
+            }
+        }
+
+        async function loadWatchHistory() {
+            var tbody = document.getElementById('analytics-history-body');
+            if (!tbody) return;
+            try {
+                var user = document.getElementById('analytics-history-user-filter').value || '';
+                var item = document.getElementById('analytics-history-item-filter').value || '';
+                var url = '/api/admin/analytics/history?limit=120'
+                    + '&days=' + encodeURIComponent(analyticsRangeDays)
+                    + '&user=' + encodeURIComponent(user)
+                    + '&item=' + encodeURIComponent(item);
+                var res = await fetch(url);
+                if (!res.ok) throw new Error('Unable to load watch history');
+                var data = await res.json();
+                var history = Array.isArray(data.history) ? data.history : [];
+                if (!history.length) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;">No watch history matches the current filters.</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = history.map(function(entry) {
+                    return '<tr>' +
+                        '<td>' + escapeHtml(entry.lastSeenAt ? new Date(entry.lastSeenAt).toLocaleString() : 'Unknown') + '</td>' +
+                        '<td>' + analyticsEntityButton('item', entry.itemId || entry.itemName, entry.itemName || entry.itemId || 'Unknown Item') + '</td>' +
+                        '<td>' + analyticsEntityButton('user', entry.userId || entry.username, entry.username || entry.userId || 'Unknown User') + '</td>' +
+                        '<td>' + escapeHtml(entry.libraryName || entry.libraryId || 'Unknown Library') + '</td>' +
+                        '<td>' + escapeHtml(formatDurationMs(entry.playDurationMs)) + '</td>' +
+                        '<td>' + escapeHtml((entry.completed ? 'Completed' : 'In Progress') + ((entry.sessionCount || 1) > 1 ? ' • ' + entry.sessionCount + ' merged' : '')) + '</td>' +
+                    '</tr>';
+                }).join('');
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;">Could not load watch history.</td></tr>';
+            }
+        }
+
+        function changeAnalyticsRange() {
+            var rangeEl = document.getElementById('analytics-range-days');
+            analyticsRangeDays = Number(rangeEl && rangeEl.value) || 30;
+            loadAnalyticsOverview(true);
+            loadWatchHistory();
+        }
+
+        function clearAnalyticsEntityDetail() {
+            selectedAnalyticsEntity = null;
+            document.getElementById('analytics-entity-title').textContent = 'Detail Drilldown';
+            document.getElementById('analytics-entity-meta').textContent = 'Select a user or item from the rankings or watch history.';
+            document.getElementById('analytics-entity-summary').innerHTML = '';
+            document.getElementById('analytics-entity-history').innerHTML = '<div class="log-meta">No drilldown selected.</div>';
+        }
+
+        async function loadAnalyticsEntityDetail(type, ref) {
+            selectedAnalyticsEntity = { type: type, ref: ref };
+            try {
+                var res = await fetch('/api/admin/analytics/' + encodeURIComponent(type === 'user' ? 'users' : 'items') + '/' + encodeURIComponent(ref) + '?limit=20');
+                if (!res.ok) throw new Error('Unable to load drilldown');
+                var data = await res.json();
+                var overview = data.overview || {};
+                var history = Array.isArray(data.history) ? data.history : [];
+                var maxHistoryDuration = history.reduce(function(max, entry) {
+                    return Math.max(max, Number(entry.playDurationMs) || 0);
+                }, 0);
+                if (type === 'user') {
+                    document.getElementById('analytics-entity-title').textContent = overview.username || overview.userId || 'User Detail';
+                    document.getElementById('analytics-entity-meta').textContent = 'User analytics drilldown';
+                    document.getElementById('analytics-entity-summary').innerHTML =
+                        '<div class="analytics-detail-pill">Sessions: ' + escapeHtml(String(overview.sessionCount || 0)) + '</div>' +
+                        '<div class="analytics-detail-pill">Watch Time: ' + escapeHtml(formatDurationMs(overview.totalPlayDurationMs)) + '</div>' +
+                        '<div class="analytics-detail-pill">Items: ' + escapeHtml(String(overview.uniqueItems || 0)) + '</div>' +
+                        '<div class="analytics-detail-pill">Libraries: ' + escapeHtml(String(overview.uniqueLibraries || 0)) + '</div>';
+                } else {
+                    var itemMetadata = overview.itemMetadata || null;
+                    document.getElementById('analytics-entity-title').textContent = overview.itemName || overview.itemId || 'Item Detail';
+                    document.getElementById('analytics-entity-meta').textContent = (overview.itemType || 'Unknown Type') + ' • item analytics drilldown' + (itemMetadata ? ' • ' + buildMetadataLine(itemMetadata) : '');
+                    document.getElementById('analytics-entity-summary').innerHTML =
+                        (itemMetadata && itemMetadata.primaryImageTag ? '<div class="analytics-media-hero"><img class="analytics-media-poster" src="' + buildArtworkUrl(itemMetadata) + '" alt="' + escapeHtml(overview.itemName || 'Item poster') + '"><div class="analytics-media-copy">' +
+                        '<div class="analytics-media-overview">' + escapeHtml(itemMetadata.overview || 'No overview available.') + '</div>' +
+                        '</div></div>' : '') +
+                        '<div class="analytics-detail-pill">Sessions: ' + escapeHtml(String(overview.sessionCount || 0)) + '</div>' +
+                        '<div class="analytics-detail-pill">Watch Time: ' + escapeHtml(formatDurationMs(overview.totalPlayDurationMs)) + '</div>' +
+                        '<div class="analytics-detail-pill">Users: ' + escapeHtml(String(overview.uniqueUsers || 0)) + '</div>' +
+                        '<div class="analytics-detail-pill">Libraries: ' + escapeHtml(String(overview.uniqueLibraries || 0)) + '</div>' +
+                        '<div class="analytics-detail-pill">Runtime: ' + escapeHtml(formatMetadataRuntime(itemMetadata, itemMetadata && itemMetadata.runtimeTicks)) + '</div>';
+                }
+
+                if (!history.length) {
+                    document.getElementById('analytics-entity-history').innerHTML = '<div class="log-meta">No recent history for this drilldown.</div>';
+                    return;
+                }
+
+                document.getElementById('analytics-entity-history').innerHTML = history.map(function(entry) {
+                    return '<div class="analytics-entity-row">' +
+                        '<div class="analytics-entity-row-title">' + escapeHtml(type === 'user' ? (entry.itemName || entry.itemId || 'Unknown Item') : (entry.username || entry.userId || 'Unknown User')) + '</div>' +
+                        '<div class="analytics-entity-row-meta">' +
+                            escapeHtml(entry.lastSeenAt ? new Date(entry.lastSeenAt).toLocaleString() : 'Unknown') +
+                            ' • ' + escapeHtml(formatDurationMs(entry.playDurationMs)) +
+                            ' • ' + escapeHtml(entry.libraryName || entry.libraryId || 'Unknown Library') +
+                            ((entry.sessionCount || 1) > 1 ? ' • ' + escapeHtml(String(entry.sessionCount)) + ' merged' : '') +
+                        '</div>' +
+                        createSparkBar(Number(entry.playDurationMs) || 0, maxHistoryDuration, type === 'user' ? 'analytics-bar-fill-item' : 'analytics-bar-fill-user') +
+                    '</div>';
+                }).join('');
+            } catch (e) {
+                document.getElementById('analytics-entity-title').textContent = 'Drilldown Failed';
+                document.getElementById('analytics-entity-meta').textContent = ref;
+                document.getElementById('analytics-entity-summary').innerHTML = '';
+                document.getElementById('analytics-entity-history').innerHTML = '<div class="log-meta">Could not load drilldown details.</div>';
+            }
         }
 
         function renderDeviceLogList() {
@@ -814,6 +1416,8 @@ let autoScrollEnabled = true;
             loadSyncLog();
             validateRealTimeInputs();
             await loadDeviceLogs();
+            await loadAnalyticsOverview(false);
+            await loadWatchHistory();
             await loadSnapshots();
             connectWebSocket();
 
@@ -845,6 +1449,7 @@ let autoScrollEnabled = true;
             checkServerStatus();
             setInterval(checkServerStatus, 30000);
             setInterval(loadDeviceLogs, 15000);
+            setInterval(function() { loadAnalyticsOverview(false); }, 30000);
         }
 
         init();
@@ -1043,6 +1648,10 @@ function connectWebSocket() {
                 // Prepend or append new logs
                 currentDeviceLogs = [...data.logs, ...currentDeviceLogs];
                 renderLogs();
+            } else if (data.type === 'analytics_sessions_ingested') {
+                loadAnalyticsOverview(false);
+            } else if (data.type === 'analytics_sync_completed') {
+                loadAnalyticsOverview(false);
             }
         } catch (e) {}
     };
