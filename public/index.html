@@ -89,6 +89,16 @@
                 <p style="margin-top: 20px; font-family: monospace; font-size: 0.8rem; color: var(--text-muted);" id="qr-payload-text"></p>
             </div>
 
+            <div class="card">
+                <h3>Pair TV</h3>
+                <p style="color: var(--text-muted);">Use your phone to scan the TV QR code or pair by entering the TV's short code.</p>
+                <div style="display:flex;gap:12px;flex-wrap:wrap;">
+                    <button onclick="openTvPairingModal()">Pair TV</button>
+                    <button class="secondary" onclick="openTvPairingModal('scan')">Scan TV QR</button>
+                    <button class="secondary" onclick="openTvPairingModal('manual')">Enter TV Code</button>
+                </div>
+            </div>
+
             <!-- Setup Token -->
             <div class="card">
                 <h3>Setup Token</h3>
@@ -710,7 +720,73 @@
         </div>
     </main>
 
+    <div id="tv-pairing-modal" class="tv-pairing-overlay" style="display:none;">
+        <div class="tv-pairing-modal">
+            <div class="tv-pairing-header">
+                <div>
+                    <h3 style="margin:0;">Pair TV</h3>
+                    <div id="tv-pairing-subtitle" class="tv-pairing-subtitle">Choose how to connect this phone companion to your Google TV.</div>
+                </div>
+                <button class="secondary tv-pairing-close" onclick="closeTvPairingModal()">&times;</button>
+            </div>
+
+            <div id="tv-pairing-step-home" class="tv-pairing-step active">
+                <div class="tv-pairing-option-grid">
+                    <button class="tv-pairing-option" onclick="showTvPairingStep('scan')">
+                        <span>Scan TV QR</span>
+                        <small>Use the phone camera to scan the code shown on the TV.</small>
+                    </button>
+                    <button class="tv-pairing-option" onclick="showTvPairingStep('manual')">
+                        <span>Enter TV Code</span>
+                        <small>Discover TVs on your local network and match the 6-character code.</small>
+                    </button>
+                </div>
+            </div>
+
+            <div id="tv-pairing-step-scan" class="tv-pairing-step">
+                <div class="tv-pairing-camera-shell">
+                    <video id="tv-pairing-video" autoplay playsinline muted></video>
+                    <div id="tv-pairing-camera-placeholder" class="tv-pairing-camera-placeholder">Camera preview will appear here.</div>
+                </div>
+                <p class="tv-pairing-help">Point the camera at the QR code shown on the TV.</p>
+                <div class="tv-pairing-actions">
+                    <button class="secondary" onclick="restartTvQrScanner()">Restart Camera</button>
+                    <button class="secondary" onclick="showTvPairingStep('home')">Back</button>
+                </div>
+            </div>
+
+            <div id="tv-pairing-step-manual" class="tv-pairing-step">
+                <label for="tv-manual-code-input" class="setting-label">TV Code</label>
+                <input id="tv-manual-code-input" type="text" maxlength="6" placeholder="ABC123" autocomplete="one-time-code">
+                <p class="tv-pairing-help">Enter the 6-character code shown below the TV QR code.</p>
+                <div class="tv-pairing-actions">
+                    <button onclick="discoverTvByManualCode()">Find TVs</button>
+                    <button class="secondary" onclick="showTvPairingStep('home')">Back</button>
+                </div>
+                <div id="tv-pairing-manual-results" class="tv-pairing-results"></div>
+            </div>
+
+            <div id="tv-pairing-step-confirm" class="tv-pairing-step">
+                <div id="tv-pairing-confirm-card" class="tv-pairing-confirm-card"></div>
+                <div class="tv-pairing-actions">
+                    <button id="tv-pairing-confirm-button" onclick="confirmTvPairing()">Send Config To TV</button>
+                    <button class="secondary" onclick="returnToTvPairingSource()">Back</button>
+                </div>
+            </div>
+
+            <div id="tv-pairing-step-status" class="tv-pairing-step">
+                <div id="tv-pairing-status-card" class="tv-pairing-status-card"></div>
+                <div class="tv-pairing-actions">
+                    <button class="secondary" onclick="showTvPairingStep('home')">Done</button>
+                </div>
+            </div>
+
+            <div id="tv-pairing-error" class="tv-pairing-error" style="display:none;"></div>
+        </div>
+    </div>
+
     <script src="app.js"></script>
+    <script src="tv-pairing.js"></script>
 
 </body>
 </html>

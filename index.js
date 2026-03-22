@@ -17,6 +17,15 @@ const { createStorage } = require('./storage');
 const rateLimit = require('express-rate-limit');
 const fs = require('fs');
 const path = require('path');
+const {
+  normalizeManualCode,
+  validateTvPairingPayload,
+  validateTvPairingInfo,
+  getPrivateIpv4ScanTargets,
+  buildTvReceiverUrl,
+  buildTvInfoUrl,
+  buildTvPairingEnvelope
+} = require('./tv-pairing');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 1982;
@@ -100,6 +109,9 @@ const analyticsSyncState = {
   websocketLastMessageAt: null
 };
 const jellyfinRealtimeSockets = new Map();
+const TV_PAIRING_DISCOVERY_TIMEOUT_MS = 1200;
+const TV_PAIRING_POST_TIMEOUT_MS = 5000;
+const TV_PAIRING_DISCOVERY_CONCURRENCY = 24;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -674,6 +686,173 @@ async function httpPost(urlStr, body, headers = {}, timeout = 5000) {
   }
 }
 
+function buildCompanionBaseUrl(req, requestedUrl) {
+  const raw = String(requestedUrl || '').trim();
+  const protoHeader = req.headers['x-forwarded-proto'];
+  const fallbackProtocol = typeof protoHeader === 'string' && protoHeader
+    ? protoHeader.split(',')[0].trim()
+    : (req.protocol || 'http');
+  const fallbackUrl = `${fallbackProtocol}://${req.get('host')}`;
+  const candidate = raw || fallbackUrl;
+  const parsed = new URL(candidate);
+  if (!/^https?:$/i.test(parsed.protocol)) {
+    throw new Error('Companion URL must use HTTP or HTTPS');
+  }
+  return parsed.toString().replace(/\/+$/, '');
+}
+
+async function mapWithConcurrency(items, concurrency, worker) {
+  const list = Array.isArray(items) ? items : [];
+  const size = Math.max(1, Math.min(concurrency || 1, list.length || 1));
+  const results = new Array(list.length);
+  let nextIndex = 0;
+
+  async function runWorker() {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= list.length) return;
+      results[index] = await worker(list[index], index);
+    }
+  }
+
+  await Promise.all(Array.from({ length: size }, runWorker));
+  return results;
+}
+
+function getTvDiscoveryTargets() {
+  return getPrivateIpv4ScanTargets(os.networkInterfaces());
+}
+
+async function fetchTvPairingCandidate(target) {
+  try {
+    const result = await httpGet(buildTvInfoUrl(target.ip), {}, TV_PAIRING_DISCOVERY_TIMEOUT_MS);
+    if (result.status !== 200 || !result.data || typeof result.data !== 'object') {
+      return null;
+    }
+    const validated = validateTvPairingInfo(result.data);
+    if (!validated.ok && !validated.issues.every((issue) => /expired/i.test(issue))) {
+      return null;
+    }
+    return {
+      interfaceName: target.interfaceName,
+      sourceAddress: target.sourceAddress,
+      ip: target.ip,
+      receiver_url: buildTvReceiverUrl(target.ip),
+      version: validated.info.version,
+      manual_code: validated.info.manual_code,
+      device_name: validated.info.device_name || `TV ${target.ip}`,
+      expires_at_epoch_ms: validated.info.expires_at_epoch_ms,
+      pairing_token: validated.info.pairing_token || ''
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+async function discoverTvCandidates(manualCode) {
+  const normalizedCode = normalizeManualCode(manualCode);
+  if (!normalizedCode || normalizedCode.length !== 6) {
+    return { error: 'invalid_code', message: 'Enter the 6-character TV code.', candidates: [] };
+  }
+
+  const targets = getTvDiscoveryTargets();
+  if (!targets.length) {
+    return { error: 'local_network_unavailable', message: 'No private local network was found on the companion host.', candidates: [] };
+  }
+
+  console.info('TV pairing discovery started:', { targetCount: targets.length, codePrefix: normalizedCode.slice(0, 3) });
+  const scanned = await mapWithConcurrency(targets, TV_PAIRING_DISCOVERY_CONCURRENCY, fetchTvPairingCandidate);
+  const candidates = scanned.filter(Boolean).filter((entry) => entry.manual_code === normalizedCode);
+  const now = Date.now();
+  const activeCandidates = candidates.filter((entry) => Number(entry.expires_at_epoch_ms) > now);
+
+  console.info('TV pairing discovery completed:', {
+    targetCount: targets.length,
+    respondingCount: scanned.filter(Boolean).length,
+    matchedCount: candidates.length,
+    activeCount: activeCandidates.length
+  });
+
+  if (activeCandidates.length > 0) {
+    return { candidates: activeCandidates, scannedCount: targets.length };
+  }
+  if (candidates.length > 0) {
+    return {
+      error: 'expired_code',
+      message: 'That TV code has expired. Start pairing again on the TV and try once more.',
+      candidates,
+      scannedCount: targets.length
+    };
+  }
+  return {
+    error: 'code_not_found',
+    message: 'No TV on the local network matched that code.',
+    candidates: [],
+    scannedCount: targets.length
+  };
+}
+
+function buildTvPairingError(result, usedManualCodeFallback) {
+  const errorCode = result && result.data && typeof result.data === 'object' ? result.data.error : null;
+  if (result && result.status === 401 && errorCode === 'invalid_pairing_token') {
+    if (usedManualCodeFallback) {
+      return {
+        error: 'invalid_pairing_token',
+        message: 'The TV rejected manual-code pairing. This TV build still requires the hidden full pairing token for manual pairing.'
+      };
+    }
+    return {
+      error: 'invalid_pairing_token',
+      message: 'The TV rejected the pairing token.'
+    };
+  }
+  if (result && result.status >= 500) {
+    return {
+      error: 'config_push_failed',
+      message: 'The TV could not apply the companion config.'
+    };
+  }
+  return {
+    error: 'config_push_failed',
+    message: `Pairing failed with HTTP ${result ? result.status : 'unknown'}.`
+  };
+}
+
+async function postTvPairingEnvelope({ payload, companionUrl, pairingTokenOverride }) {
+  appConfig = storage.getConfig();
+  const envelope = buildTvPairingEnvelope(appConfig, companionUrl);
+  const token = String(pairingTokenOverride || payload.pairing_token || '').trim();
+  let result;
+  try {
+    result = await httpPost(payload.receiver_url, envelope, {
+      'X-Pairing-Token': token
+    }, TV_PAIRING_POST_TIMEOUT_MS);
+  } catch (error) {
+    throw {
+      error: 'tv_unreachable',
+      message: error && error.name === 'AbortError'
+        ? 'The TV did not respond in time.'
+        : 'The TV could not be reached on the local network.'
+    };
+  }
+
+  if (result.status < 200 || result.status >= 300) {
+    throw buildTvPairingError(result, !!pairingTokenOverride && pairingTokenOverride === payload.manual_code);
+  }
+
+  console.info('TV pairing config pushed:', {
+    deviceName: payload.device_name || 'Unknown TV',
+    receiverUrl: payload.receiver_url,
+    expiresAt: payload.expires_at_epoch_ms
+  });
+
+  return {
+    status: result.status,
+    data: result.data
+  };
+}
+
 function parseCookies(req) {
   const header = req.headers.cookie || '';
   const cookies = {};
@@ -777,6 +956,125 @@ adminRouter.get('/qr', async (req, res) => {
     res.json({ qr: qrImage, payload });
   } catch (err) {
     res.status(500).json({ error: 'QR fail' });
+  }
+});
+
+adminRouter.post('/tv-pairing/discover', async (req, res) => {
+  try {
+    const manualCode = normalizeManualCode(req.body && req.body.manualCode);
+    const result = await discoverTvCandidates(manualCode);
+    if (result.error === 'invalid_code') {
+      return res.status(400).json(result);
+    }
+    if (result.error === 'local_network_unavailable') {
+      return res.status(503).json(result);
+    }
+    if (result.error === 'expired_code') {
+      return res.status(410).json(result);
+    }
+    if (result.error === 'code_not_found') {
+      return res.status(404).json(result);
+    }
+    res.json({
+      candidates: result.candidates,
+      scannedCount: result.scannedCount
+    });
+  } catch (error) {
+    console.warn('TV pairing discovery failed:', error.message);
+    res.status(500).json({
+      error: 'discovery_failed',
+      message: 'TV discovery failed.'
+    });
+  }
+});
+
+adminRouter.post('/tv-pairing/pair-qr', async (req, res) => {
+  try {
+    const parsedPayload = typeof req.body.payload === 'string' ? JSON.parse(req.body.payload) : req.body.payload;
+    const validated = validateTvPairingPayload(parsedPayload);
+    if (!validated.ok) {
+      return res.status(400).json({
+        error: 'invalid_qr_payload',
+        message: validated.issues[0] || 'The scanned TV QR code is invalid.'
+      });
+    }
+    const companionUrl = buildCompanionBaseUrl(req, req.body.companionUrl);
+    await postTvPairingEnvelope({
+      payload: validated.payload,
+      companionUrl
+    });
+    res.json({
+      ok: true,
+      deviceName: validated.payload.device_name || 'TV'
+    });
+  } catch (error) {
+    const status = error && error.error
+      ? (error.error === 'invalid_pairing_token' ? 401 : (error.error === 'tv_unreachable' ? 504 : 502))
+      : 500;
+    console.warn('TV QR pairing failed:', error.message);
+    res.status(status).json({
+      error: error.error || 'pairing_failed',
+      message: error.message || 'TV pairing failed.'
+    });
+  }
+});
+
+adminRouter.post('/tv-pairing/pair-manual', async (req, res) => {
+  try {
+    const candidate = req.body && typeof req.body.candidate === 'object' ? req.body.candidate : {};
+    const infoValidation = validateTvPairingInfo(candidate);
+    if (!infoValidation.ok) {
+      return res.status(400).json({
+        error: 'invalid_candidate',
+        message: infoValidation.issues[0] || 'The selected TV pairing candidate is invalid.'
+      });
+    }
+
+    const receiverUrl = String(candidate.receiver_url || '').trim() || buildTvReceiverUrl(candidate.ip);
+    const payload = {
+      version: 1,
+      receiver_url: receiverUrl,
+      pairing_token: typeof candidate.pairing_token === 'string' ? candidate.pairing_token.trim() : '',
+      manual_code: infoValidation.info.manual_code,
+      device_name: infoValidation.info.device_name,
+      expires_at_epoch_ms: infoValidation.info.expires_at_epoch_ms
+    };
+    const validated = validateTvPairingPayload(payload);
+    const companionUrl = buildCompanionBaseUrl(req, req.body.companionUrl);
+    const fallbackToken = payload.pairing_token || payload.manual_code;
+    const remainingIssues = validated.issues.filter((issue) => !(payload.pairing_token === '' && /pairing token/i.test(issue)));
+    if (remainingIssues.length > 0) {
+      return res.status(400).json({
+        error: 'invalid_candidate',
+        message: remainingIssues[0]
+      });
+    }
+    if (Number(payload.expires_at_epoch_ms) <= Date.now()) {
+      return res.status(410).json({
+        error: 'expired_code',
+        message: 'That TV code has expired. Start pairing again on the TV and try once more.'
+      });
+    }
+
+    await postTvPairingEnvelope({
+      payload,
+      companionUrl,
+      pairingTokenOverride: fallbackToken
+    });
+    res.json({
+      ok: true,
+      deviceName: payload.device_name || candidate.ip || 'TV',
+      usedManualCodeFallback: !payload.pairing_token
+    });
+  } catch (error) {
+    const status = error && error.error
+      ? (error.error === 'invalid_pairing_token' ? 401 : (error.error === 'tv_unreachable' ? 504 : 502))
+      : 500;
+    console.warn('TV manual pairing failed:', error.message);
+    res.status(status).json({
+      error: error.error || 'pairing_failed',
+      message: error.message || 'TV pairing failed.'
+    });
   }
 });
 

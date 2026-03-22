@@ -1184,3 +1184,184 @@
 .log-level-info { color: #4caf50; }
 .log-level-warn { color: #ffeb3b; }
 .log-level-error { color: #f44336; }
+
+.tv-pairing-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.72);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1500;
+    padding: 24px;
+    backdrop-filter: blur(6px);
+}
+
+.tv-pairing-modal {
+    width: min(640px, 100%);
+    max-height: min(90vh, 920px);
+    overflow: auto;
+    background: linear-gradient(180deg, rgba(28, 28, 28, 0.98), rgba(14, 14, 14, 0.98));
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 18px;
+    box-shadow: 0 24px 72px rgba(0, 0, 0, 0.55);
+    padding: 24px;
+}
+
+.tv-pairing-header {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: flex-start;
+    margin-bottom: 20px;
+}
+
+.tv-pairing-subtitle,
+.tv-pairing-help {
+    color: var(--text-muted);
+    font-size: 0.92rem;
+}
+
+.tv-pairing-close {
+    min-width: 48px;
+    padding: 10px 16px;
+    font-size: 1.4rem;
+    line-height: 1;
+}
+
+.tv-pairing-step {
+    display: none;
+}
+
+.tv-pairing-step.active {
+    display: block;
+}
+
+.tv-pairing-option-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+}
+
+.tv-pairing-option {
+    text-align: left;
+    min-height: 120px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    justify-content: center;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: linear-gradient(180deg, rgba(0, 164, 220, 0.14), rgba(255, 255, 255, 0.04));
+}
+
+.tv-pairing-option span {
+    font-size: 1.1rem;
+}
+
+.tv-pairing-option small {
+    color: rgba(255, 255, 255, 0.72);
+    font-size: 0.88rem;
+}
+
+.tv-pairing-camera-shell {
+    position: relative;
+    background: #050505;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+    overflow: hidden;
+    aspect-ratio: 4 / 3;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.tv-pairing-camera-shell video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: none;
+}
+
+.tv-pairing-camera-shell video.active {
+    display: block;
+}
+
+.tv-pairing-camera-placeholder {
+    color: var(--text-muted);
+    padding: 24px;
+    text-align: center;
+}
+
+.tv-pairing-actions {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 16px;
+}
+
+.tv-pairing-results {
+    margin-top: 18px;
+    display: grid;
+    gap: 12px;
+}
+
+.tv-pairing-result-item,
+.tv-pairing-confirm-card,
+.tv-pairing-status-card {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+    padding: 16px;
+}
+
+.tv-pairing-result-meta,
+.tv-pairing-confirm-meta {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+.tv-pairing-result-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+}
+
+.tv-pairing-error {
+    margin-top: 18px;
+    color: #ffd3dc;
+    background: rgba(198, 40, 40, 0.2);
+    border: 1px solid rgba(198, 40, 40, 0.45);
+    border-radius: 12px;
+    padding: 12px 14px;
+}
+
+.tv-pairing-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    border-radius: 999px;
+    padding: 6px 10px;
+    font-size: 0.82rem;
+    background: rgba(0, 164, 220, 0.16);
+    color: #9fdef4;
+}
+
+@media (max-width: 768px) {
+    .tv-pairing-overlay {
+        padding: 12px;
+    }
+
+    .tv-pairing-modal {
+        padding: 18px;
+    }
+
+    .tv-pairing-option-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .tv-pairing-result-item {
+        flex-direction: column;
+        align-items: stretch;
+    }
+}
