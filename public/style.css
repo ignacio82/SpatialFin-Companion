@@ -570,37 +570,95 @@
             padding: 0;
         }
 
+        .mobile-header {
+            display: none;
+        }
+        .sidebar-overlay {
+            display: none;
+        }
+        .install-btn {
+            background-color: var(--primary);
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-weight: bold;
+            font-size: 0.85rem;
+            cursor: pointer;
+            margin-right: 16px;
+        }
+
         /* Mobile responsive */
         @media (max-width: 768px) {
-            nav {
+            .mobile-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                height: 60px;
+                background-color: #080808;
+                border-bottom: 1px solid #333;
                 position: fixed;
-                bottom: 0;
-                top: auto;
-                width: 100%;
-                height: auto;
-                flex-direction: row;
-                padding: 0;
-                border-right: none;
-                border-top: 1px solid #333;
-                overflow-x: auto;
+                top: 0;
+                left: 0;
+                right: 0;
+                z-index: 100;
             }
 
-            .logo-container { display: none; }
+            .mobile-header h1 {
+                font-size: 1.2rem;
+                margin: 0;
+                color: var(--primary);
+                letter-spacing: 1px;
+                margin-left: 60px; /* space for hamburger */
+            }
+
+            .hamburger {
+                display: flex;
+                top: 8px;
+                left: 8px;
+                z-index: 200;
+                background: transparent;
+                border: none;
+                color: var(--text-main);
+            }
+
+            .sidebar-overlay {
+                position: fixed;
+                top: 0; left: 0; right: 0; bottom: 0;
+                background: rgba(0,0,0,0.6);
+                z-index: 90;
+                display: none;
+                backdrop-filter: blur(2px);
+            }
+            .sidebar-overlay.open {
+                display: block;
+            }
+
+            nav {
+                transform: translateX(-100%);
+                width: 260px;
+                padding-top: 2rem;
+            }
+
+            nav.open {
+                transform: translateX(0);
+            }
+
+            .logo-container { display: flex; }
 
             .nav-link {
-                flex: 1;
-                text-align: center;
-                font-size: 0.75rem;
-                padding: 10px 6px;
-                margin-bottom: 0;
-                border-radius: 0;
-                white-space: nowrap;
+                font-size: 1rem;
+                padding: 14px 16px;
+                margin-bottom: 8px;
+                border-radius: 8px;
+                white-space: normal;
+                text-align: left;
             }
 
             main {
                 margin-left: 0;
-                padding: 1.5rem;
-                padding-bottom: 80px;
+                padding: 1rem;
+                padding-top: 80px;
             }
 
             input[type="text"], input[type="password"], input[type="number"], input[type="url"], select {
@@ -614,16 +672,14 @@
                 gap: 10px;
             }
 
-            .setting-info { margin-right: 0; }
+            .setting-info { margin-right: 0; width: 100%; }
 
             .stats-grid {
                 grid-template-columns: 1fr;
             }
 
-            .hamburger { display: none; }
-
             .toast-container {
-                bottom: 80px;
+                bottom: 24px;
                 right: 12px;
                 left: 12px;
             }

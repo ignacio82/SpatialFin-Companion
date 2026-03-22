@@ -169,6 +169,9 @@ let autoScrollEnabled = true;
             // Close sidebar on tablet after navigating
             var nav = document.getElementById('main-nav');
             if (nav.classList.contains('open')) nav.classList.remove('open');
+            var overlay = document.getElementById('sidebar-overlay');
+            if (overlay && overlay.classList.contains('open')) overlay.classList.remove('open');
+            
             if (id === 'device-logs') loadDeviceLogs();
             if (id === 'history') loadSnapshots();
         }
@@ -177,6 +180,8 @@ let autoScrollEnabled = true;
         function toggleSidebar() {
             var nav = document.getElementById('main-nav');
             nav.classList.toggle('open');
+            var overlay = document.getElementById('sidebar-overlay');
+            if (overlay) overlay.classList.toggle('open');
         }
 
         // ── QR ──
@@ -844,6 +849,32 @@ let autoScrollEnabled = true;
 
         init();
         if ('serviceWorker' in navigator) { window.addEventListener('load', function() { navigator.serviceWorker.register('/sw.js'); }); }
+
+        // -- PWA Install Prompt --
+        let deferredPrompt;
+        window.addEventListener('beforeinstallprompt', (e) => {
+            e.preventDefault();
+            deferredPrompt = e;
+            const installBtn = document.getElementById('install-button');
+            if (installBtn) {
+                installBtn.style.display = 'block';
+                installBtn.addEventListener('click', async () => {
+                    if (deferredPrompt) {
+                        deferredPrompt.prompt();
+                        const { outcome } = await deferredPrompt.userChoice;
+                        if (outcome === 'accepted') {
+                            installBtn.style.display = 'none';
+                        }
+                        deferredPrompt = null;
+                    }
+                });
+            }
+        });
+
+        window.addEventListener('appinstalled', () => {
+            const installBtn = document.getElementById('install-button');
+            if (installBtn) installBtn.style.display = 'none';
+        });
 
 // -- Additional Features --
 
