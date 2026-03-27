@@ -72,6 +72,22 @@ let autoScrollEnabled = true;
             return /^https?:\/\/.+/.test(value);
         }
 
+        function clearShareTestResult(idx) {
+            var resultEl = document.getElementById('share-test-' + idx);
+            if (!resultEl) return;
+            resultEl.className = 'test-result';
+            resultEl.textContent = '';
+            resultEl.title = '';
+        }
+
+        function setShareTestResult(idx, state, message, title) {
+            var resultEl = document.getElementById('share-test-' + idx);
+            if (!resultEl) return;
+            resultEl.className = state ? ('test-result ' + state) : 'test-result';
+            resultEl.textContent = message || '';
+            resultEl.title = title || '';
+        }
+
         function setFieldInvalid(el, msg) {
             el.classList.add('invalid');
             var existing = el.parentNode.querySelector('.field-error');
@@ -332,6 +348,45 @@ let autoScrollEnabled = true;
             } catch (e) {
                 resultEl.className = 'test-result fail';
                 resultEl.textContent = '\u2718 Error';
+            }
+        }
+
+        async function testShare(idx) {
+            var share = configData.networkShares[idx];
+            var buttonEl = document.getElementById('share-test-btn-' + idx);
+            var protocolLabel = share && share.protocol === 'nfs' ? 'NFS' : 'SMB';
+            if (!share) return;
+            if (buttonEl) buttonEl.disabled = true;
+            setShareTestResult(idx, '', 'Testing...', 'Testing ' + protocolLabel + ' connection...');
+            try {
+                var res = await fetch('/api/admin/test-network-share', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(share)
+                });
+                var data = await res.json();
+                if (res.ok && data.success) {
+                    var detail = data.protocol === 'nfs'
+                        ? (data.exportVerified ? 'export verified' : 'port reachable')
+                        : (data.fileCount === 1 ? '1 item' : (data.fileCount + ' items'));
+                    var title = 'Connected to ' + (data.targetPath || (data.protocol === 'nfs' ? '/' : '\\'));
+                    if (Array.isArray(data.sample) && data.sample.length > 0) {
+                        title += data.protocol === 'nfs'
+                            ? ' | Exports: ' + data.sample.join(', ')
+                            : ' | Sample: ' + data.sample.join(', ');
+                    }
+                    if (data.warning) title += ' | ' + data.warning;
+                    setShareTestResult(idx, 'success', 'Reachable (' + detail + ')', title);
+                    showToast(protocolLabel + ' share connection successful.', 'success');
+                } else {
+                    setShareTestResult(idx, 'fail', 'Failed', data.error || 'Unable to connect.');
+                    showToast(protocolLabel + ' share test failed: ' + (data.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                setShareTestResult(idx, 'fail', 'Error', 'Connection error');
+                showToast(protocolLabel + ' share test error: ' + e.message, 'error');
+            } finally {
+                if (buttonEl) buttonEl.disabled = false;
             }
         }
 
@@ -1226,37 +1281,44 @@ let autoScrollEnabled = true;
             configData.networkShares.forEach(function(share, idx) {
                 var card = document.createElement('div');
                 card.className = "card";
+                var protocolLabel = share.protocol === 'nfs' ? 'NFS' : 'SMB';
+                var shareNameLabel = share.protocol === 'nfs' ? 'Export Path' : 'Share Name / Path';
+                var testControls = '<button class="secondary" id="share-test-btn-' + idx + '" onclick="testShare(' + idx + ')">Test ' + protocolLabel + '</button>' +
+                    '<span id="share-test-' + idx + '" class="test-result"></span>';
                 card.innerHTML = '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">' +
                     '<input type="text" placeholder="Display Name" value="' + (share.displayName || '') + '" onchange="configData.networkShares[' + idx + '].displayName=this.value;markDirty(\'network-shares\')" style="font-weight: bold; font-size: 1.1rem; width: 300px;">' +
+                    '<div style="display:flex;align-items:center;gap:8px;">' +
+                    testControls +
                     '<button class="danger" onclick="removeShare(' + idx + ')">Remove</button>' +
+                    '</div>' +
                     '</div>' +
                     '<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">' +
                     '<div>' +
                     '<label class="setting-label">Protocol</label>' +
-                    '<select onchange="configData.networkShares[' + idx + '].protocol=this.value;markDirty(\'network-shares\')" style="width: 100%;">' +
+                    '<select onchange="configData.networkShares[' + idx + '].protocol=this.value;renderShares();markDirty(\'network-shares\')" style="width: 100%;">' +
                     '<option value="smb" ' + (share.protocol === 'smb' ? 'selected' : '') + '>Samba (SMB)</option>' +
                     '<option value="nfs" ' + (share.protocol === 'nfs' ? 'selected' : '') + '>NFS</option>' +
                     '</select>' +
                     '</div>' +
                     '<div>' +
                     '<label class="setting-label">Host / IP</label>' +
-                    '<input type="text" value="' + (share.host || '') + '" onchange="configData.networkShares[' + idx + '].host=this.value;markDirty(\'network-shares\')" style="width: 100%;">' +
+                    '<input type="text" value="' + (share.host || '') + '" onchange="configData.networkShares[' + idx + '].host=this.value;clearShareTestResult(' + idx + ');markDirty(\'network-shares\')" style="width: 100%;">' +
                     '</div>' +
                     '<div>' +
-                    '<label class="setting-label">Share Name / Path</label>' +
-                    '<input type="text" value="' + (share.shareName || '') + '" onchange="configData.networkShares[' + idx + '].shareName=this.value;markDirty(\'network-shares\')" style="width: 100%;">' +
+                    '<label class="setting-label">' + shareNameLabel + '</label>' +
+                    '<input type="text" value="' + (share.shareName || '') + '" onchange="configData.networkShares[' + idx + '].shareName=this.value;clearShareTestResult(' + idx + ');markDirty(\'network-shares\')" style="width: 100%;">' +
                     '</div>' +
                     '<div>' +
                     '<label class="setting-label">Subpath (Optional)</label>' +
-                    '<input type="text" value="' + (share.path || '') + '" onchange="configData.networkShares[' + idx + '].path=this.value;markDirty(\'network-shares\')" style="width: 100%;">' +
+                    '<input type="text" value="' + (share.path || '') + '" onchange="configData.networkShares[' + idx + '].path=this.value;clearShareTestResult(' + idx + ');markDirty(\'network-shares\')" style="width: 100%;">' +
                     '</div>' +
                     '<div>' +
                     '<label class="setting-label">Username</label>' +
-                    '<input type="text" value="' + (share.username || '') + '" onchange="configData.networkShares[' + idx + '].username=this.value;markDirty(\'network-shares\')" style="width: 100%;">' +
+                    '<input type="text" value="' + (share.username || '') + '" onchange="configData.networkShares[' + idx + '].username=this.value;clearShareTestResult(' + idx + ');markDirty(\'network-shares\')" style="width: 100%;">' +
                     '</div>' +
                     '<div>' +
                     '<label class="setting-label">Password</label>' +
-                    '<input type="password" value="' + (share.password || '') + '" onchange="configData.networkShares[' + idx + '].password=this.value;markDirty(\'network-shares\')" style="width: 100%;">' +
+                    '<input type="password" value="' + (share.password || '') + '" onchange="configData.networkShares[' + idx + '].password=this.value;clearShareTestResult(' + idx + ');markDirty(\'network-shares\')" style="width: 100%;">' +
                     '</div>' +
                     '</div>';
                 container.appendChild(card);
@@ -1435,7 +1497,7 @@ let autoScrollEnabled = true;
             try {
                 var authRes = await fetch('/api/admin/auth-check');
                 var authData = await authRes.json();
-                if (authData.authRequired) {
+                if (authData.authRequired && !authData.authenticated) {
                     document.getElementById('login-overlay').style.display = 'flex';
                     document.getElementById('login-password').focus();
                     return;

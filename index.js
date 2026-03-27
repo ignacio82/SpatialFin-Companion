@@ -13,10 +13,22 @@ const helmet = require('helmet');
 const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
+const net = require('net');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const { createStorage } = require('./storage');
 const rateLimit = require('express-rate-limit');
 const fs = require('fs');
 const path = require('path');
+const {
+  buildNetworkShareTargetPath,
+  buildNfsTarget,
+  isPathWithinExport,
+  normalizeNfsExportPath,
+  normalizeShareRelativePath,
+  validateNetworkShareForTest
+} = require('./network-shares');
+const { parseSmbClientListing } = require('./share-test-utils');
 const {
   normalizeManualCode,
   validateTvPairingPayload,
@@ -30,6 +42,7 @@ const {
 const app = express();
 const PORT = Number(process.env.PORT) || 1982;
 const ANALYTICS_SYNC_INTERVAL_MS = Math.max(30_000, Number(process.env.ANALYTICS_SYNC_INTERVAL_MS) || 120_000);
+const execFileAsync = promisify(execFile);
 
 app.use(helmet({ contentSecurityPolicy: false })); // Disabled CSP for inline scripts if any
 app.use(cors());
@@ -172,6 +185,209 @@ function buildAnalyticsRequestContext(source) {
     ip: source || 'companion-internal',
     socket: { remoteAddress: source || 'companion-internal' },
     headers: { 'user-agent': source || 'companion-analytics-sync' }
+  };
+}
+
+function formatSmbShareTestError(error) {
+  const message = String(error && error.message ? error.message : error || 'Unknown SMB error');
+  if (/STATUS_LOGON_FAILURE|STATUS_ACCESS_DENIED|invalid password/i.test(message)) {
+    return 'Authentication failed. Check the SMB username and password.';
+  }
+  if (/STATUS_BAD_NETWORK_NAME|share name cannot be found|shared resource could not be found/i.test(message)) {
+    return 'Share not found. Check the host and share name.';
+  }
+  if (/STATUS_OBJECT_PATH_NOT_FOUND|STATUS_OBJECT_NAME_NOT_FOUND|STATUS_NO_SUCH_FILE/i.test(message)) {
+    return 'Path not found inside the SMB share.';
+  }
+  if (/STATUS_BAD_NETWORK_PATH|STATUS_HOST_UNREACHABLE|STATUS_NETWORK_NAME_DELETED|ETIMEDOUT|ECONNREFUSED|EHOSTUNREACH|ENOTFOUND/i.test(message)) {
+    return 'Unable to reach the SMB server.';
+  }
+  return message;
+}
+
+async function testSmbShareConnectionWithSmbClient(share) {
+  const probePath = normalizeShareRelativePath(share.path);
+  const args = [
+    `//${share.host}/${share.shareName}`,
+    '-U',
+    `${share.username || ''}%${share.password || ''}`,
+    '-g',
+    '-c',
+    'ls'
+  ];
+
+  if (share.domain) {
+    args.push('-W', share.domain);
+  }
+  if (share.port && share.port !== 445) {
+    args.push('-p', String(share.port));
+  }
+  if (probePath) {
+    args.push('-D', probePath);
+  }
+
+  const { stdout } = await execFileAsync('smbclient', args, {
+    timeout: 15000
+  });
+  const files = parseSmbClientListing(stdout);
+  return {
+    targetPath: probePath || '\\',
+    fileCount: files.length,
+    sample: files.slice(0, 5)
+  };
+}
+
+function formatNfsShareTestError(error) {
+  const message = String(error && error.message ? error.message : error || 'Unknown NFS error');
+  if (/not advertised by the server/i.test(message)) {
+    return 'Export path not found on the NFS server.';
+  }
+  if (/timed out|ECONNREFUSED|EHOSTUNREACH|ENOTFOUND|ENETUNREACH/i.test(message)) {
+    return 'Unable to reach the NFS server.';
+  }
+  return message;
+}
+
+function checkTcpPort(host, port, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host, port });
+
+    function cleanup() {
+      socket.removeAllListeners('connect');
+      socket.removeAllListeners('timeout');
+      socket.removeAllListeners('error');
+    }
+
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => {
+      cleanup();
+      socket.end();
+      resolve();
+    });
+    socket.once('timeout', () => {
+      cleanup();
+      socket.destroy();
+      reject(new Error(`Connection to ${host}:${port} timed out.`));
+    });
+    socket.once('error', (error) => {
+      cleanup();
+      socket.destroy();
+      reject(error);
+    });
+  });
+}
+
+function parseShowmountExports(stdout) {
+  return String(stdout || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !/^Export list for /i.test(line))
+    .map((line) => normalizeNfsExportPath(line.split(/\s+/)[0], { allowRoot: true }))
+    .filter(Boolean);
+}
+
+async function queryNfsExports(host) {
+  try {
+    const { stdout } = await execFileAsync('showmount', ['-e', host], {
+      timeout: 5000
+    });
+    return {
+      exports: parseShowmountExports(stdout),
+      warning: null
+    };
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return {
+        exports: [],
+        warning: 'Export discovery unavailable because showmount is not installed.'
+      };
+    }
+    return {
+      exports: [],
+      warning: 'Export discovery unavailable. Verified the NFS service port only.'
+    };
+  }
+}
+
+async function testSmbShareConnection(share) {
+  try {
+    try {
+      return await testSmbShareConnectionWithSmbClient(share);
+    } catch (error) {
+      if (!(error && error.code === 'ENOENT')) {
+        throw error;
+      }
+    }
+
+    const probePath = normalizeShareRelativePath(share.path);
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      ['--openssl-legacy-provider', path.join(__dirname, 'smb-probe.js')],
+      {
+        env: {
+          ...process.env,
+          SMB_TEST_OPTIONS: JSON.stringify({
+            host: share.host,
+            shareName: share.shareName,
+            username: share.username,
+            password: share.password,
+            domain: share.domain,
+            port: share.port || 445,
+            path: probePath
+          })
+        },
+        timeout: 15000
+      }
+    );
+
+    const parsed = JSON.parse(String(stdout || '').trim() || '{}');
+    if (!parsed.ok) {
+      const error = new Error(parsed.message || 'Unknown SMB error');
+      if (parsed.code) error.code = parsed.code;
+      throw error;
+    }
+    return {
+      targetPath: parsed.targetPath || '\\',
+      fileCount: Number(parsed.fileCount) || 0,
+      sample: Array.isArray(parsed.sample) ? parsed.sample : []
+    };
+  } catch (error) {
+    const stdout = error && typeof error.stdout === 'string' ? error.stdout.trim() : '';
+    if (stdout) {
+      try {
+        const parsed = JSON.parse(stdout);
+        const wrapped = new Error(parsed.message || error.message || 'Unknown SMB error');
+        if (parsed.code) wrapped.code = parsed.code;
+        throw wrapped;
+      } catch (parseError) {
+        if (parseError && parseError.message !== 'Unexpected end of JSON input' && !(parseError instanceof SyntaxError)) {
+          throw parseError;
+        }
+      }
+    }
+    throw error;
+  }
+}
+
+async function testNfsShareConnection(share) {
+  const port = share.port || 2049;
+  const targetPath = buildNetworkShareTargetPath(share);
+  const requestedExport = normalizeNfsExportPath(share.shareName, { allowRoot: true }) || '/';
+
+  await checkTcpPort(share.host, port);
+  const exportInfo = await queryNfsExports(share.host);
+  if (exportInfo.exports.length > 0) {
+    const matched = exportInfo.exports.some((exportPath) => isPathWithinExport(requestedExport, exportPath));
+    if (!matched) {
+      throw new Error('The requested export path is not advertised by the server.');
+    }
+  }
+
+  return {
+    targetPath,
+    sample: exportInfo.exports.slice(0, 5),
+    warning: exportInfo.warning,
+    exportVerified: exportInfo.exports.length > 0
   };
 }
 
@@ -875,7 +1091,7 @@ const ADMIN_PASSWORD = process.env.COMPANION_ADMIN_PASSWORD || null;
 function adminAuth(req, res, next) {
   if (!ADMIN_PASSWORD) return next();
   // Exempt login endpoint
-  if (req.path === '/login') return next();
+  if (req.path === '/login' || req.path === '/auth-check') return next();
   const cookies = parseCookies(req);
   const token = cookies['session'];
   if (token && storage.validateAdminSession(token)) return next();
@@ -918,7 +1134,15 @@ adminRouter.post('/login', loginLimiter, (req, res) => {
 });
 
 adminRouter.get('/auth-check', (req, res) => {
-  res.json({ authenticated: true, authRequired: !!ADMIN_PASSWORD });
+  if (!ADMIN_PASSWORD) {
+    return res.json({ authenticated: true, authRequired: false });
+  }
+  const cookies = parseCookies(req);
+  const token = cookies['session'];
+  res.json({
+    authenticated: !!(token && storage.validateAdminSession(token)),
+    authRequired: true
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1107,6 +1331,46 @@ adminRouter.post('/test-seerr', async (req, res) => {
     }
   } catch (err) {
     res.json({ success: false, error: err.message });
+  }
+});
+
+adminRouter.post('/test-network-share', async (req, res) => {
+  const validation = validateNetworkShareForTest(req.body || {});
+  if (!validation.ok) {
+    return res.json({
+      success: false,
+      error: validation.issues[0]
+    });
+  }
+
+  try {
+    if (validation.share.protocol === 'nfs') {
+      const result = await testNfsShareConnection(validation.share);
+      return res.json({
+        success: true,
+        protocol: 'nfs',
+        targetPath: result.targetPath,
+        exportVerified: result.exportVerified,
+        sample: result.sample,
+        warning: result.warning
+      });
+    }
+
+    const result = await testSmbShareConnection(validation.share);
+    return res.json({
+      success: true,
+      protocol: 'smb',
+      targetPath: result.targetPath,
+      fileCount: result.fileCount,
+      sample: result.sample
+    });
+  } catch (error) {
+    res.json({
+      success: false,
+      error: validation.share.protocol === 'nfs'
+        ? formatNfsShareTestError(error)
+        : formatSmbShareTestError(error)
+    });
   }
 });
 

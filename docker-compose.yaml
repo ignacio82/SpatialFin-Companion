@@ -9,6 +9,5 @@ services:
     ports:
       - "1982:1982"
     volumes:
-      - ./config.json:/app/config.json
       - ./data:/app/data
     restart: unless-stopped
