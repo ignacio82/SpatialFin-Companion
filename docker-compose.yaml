@@ -2,12 +2,11 @@ services:
   spatialfin-companion:
     build: .
     container_name: spatialfin-companion
+    network_mode: host
     environment:
       - PUID=1000
       - PGID=1000
       - TZ=Etc/UTC
-    ports:
-      - "1982:1982"
     volumes:
       - ./data:/app/data
     restart: unless-stopped

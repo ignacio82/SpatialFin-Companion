@@ -14,6 +14,7 @@ const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
 const net = require('net');
+const dns = require('dns').promises;
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 const { DEFAULT_PREFERENCES } = require('./default-preferences');
@@ -30,8 +31,17 @@ const {
   validateNetworkShareForTest
 } = require('./network-shares');
 const { parseSmbClientListing } = require('./share-test-utils');
+const { queryNfsExportsViaRpc } = require('./nfs-rpc');
+const {
+  buildPrivateIpv4DiscoveryTargets,
+  describePrivateIpv4Subnets,
+  extractHostFromAuthority,
+  parseSmbClientShareList,
+  sortAndDedupeDiscoveryResults
+} = require('./share-discovery');
 const {
   normalizeManualCode,
+  isPrivateIpv4,
   validateTvPairingPayload,
   validateTvPairingInfo,
   getPrivateIpv4ScanTargets,
@@ -76,6 +86,9 @@ const jellyfinRealtimeSockets = new Map();
 const TV_PAIRING_DISCOVERY_TIMEOUT_MS = 1200;
 const TV_PAIRING_POST_TIMEOUT_MS = 5000;
 const TV_PAIRING_DISCOVERY_CONCURRENCY = 24;
+const NETWORK_SHARE_DISCOVERY_CONNECT_TIMEOUT_MS = 700;
+const NETWORK_SHARE_DISCOVERY_CONCURRENCY = 48;
+const NETWORK_SHARE_DISCOVERY_SMB_LIST_TIMEOUT_MS = 12000;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -239,25 +252,257 @@ function parseShowmountExports(stdout) {
 
 async function queryNfsExports(host) {
   try {
+    const exports = await queryNfsExportsViaRpc(host, 12000);
+    if (exports.length > 0) {
+      return {
+        exports: exports.map((entry) => normalizeNfsExportPath(entry.path, { allowRoot: true })).filter(Boolean),
+        warning: null
+      };
+    }
+  } catch (error) {
+    const detail = extractCommandErrorOutput(error);
+    if (/Mount daemon is not registered with portmapper/i.test(detail)) {
+      return {
+        exports: [],
+        warning: 'Export discovery unavailable because this NFS server is reachable on port 2049 but does not expose mountd/rpcbind for export enumeration.'
+      };
+    }
+  }
+
+  try {
     const { stdout } = await execFileAsync('showmount', ['-e', host], {
-      timeout: 5000
+      timeout: 12000
     });
     return {
       exports: parseShowmountExports(stdout),
       warning: null
     };
   } catch (error) {
+    const fallbackExports = parseShowmountExports(error && error.stdout ? error.stdout : '');
+    if (fallbackExports.length > 0) {
+      return {
+        exports: fallbackExports,
+        warning: null
+      };
+    }
+
     if (error && error.code === 'ENOENT') {
       return {
         exports: [],
         warning: 'Export discovery unavailable because showmount is not installed.'
       };
     }
+
+    const detail = extractCommandErrorOutput(error);
+    if (/Program not registered|RPC: Program not registered|mount clntudp_create: RPC: Port mapper failure|clnt_create: RPC:/i.test(detail)) {
+      return {
+        exports: [],
+        warning: 'Export discovery unavailable because this NFS server is reachable on port 2049 but does not expose mountd/rpcbind for export enumeration.'
+      };
+    }
+    if (/timed out/i.test(detail)) {
+      return {
+        exports: [],
+        warning: 'Export discovery timed out. Verified the NFS service port only.'
+      };
+    }
     return {
       exports: [],
-      warning: 'Export discovery unavailable. Verified the NFS service port only.'
+      warning: detail || 'Export discovery unavailable. Verified the NFS service port only.'
     };
   }
+}
+
+function normalizeOptionalPort(value, fallbackPort) {
+  const port = Number(value);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return fallbackPort;
+  return port;
+}
+
+function extractCommandErrorOutput(error) {
+  if (!error) return '';
+  return [
+    error.stderr,
+    error.stdout,
+    error.message
+  ]
+    .filter((value) => typeof value === 'string' && value.trim().length > 0)
+    .join('\n')
+    .trim();
+}
+
+async function runWithConcurrency(items, limit, worker) {
+  const queue = Array.isArray(items) ? items : [];
+  const concurrency = Math.max(1, Math.min(Number(limit) || 1, queue.length || 1));
+  let index = 0;
+
+  await Promise.all(Array.from({ length: concurrency }, async () => {
+    while (index < queue.length) {
+      const currentIndex = index;
+      index += 1;
+      await worker(queue[currentIndex], currentIndex);
+    }
+  }));
+}
+
+async function resolveDiscoverySeedAddress(req) {
+  const authorities = [
+    req && req.headers ? req.headers['x-forwarded-host'] : '',
+    req && req.headers ? req.headers.host : ''
+  ];
+
+  for (const authority of authorities) {
+    const host = extractHostFromAuthority(authority);
+    if (!host || host === 'localhost') continue;
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) {
+      if (isPrivateIpv4(host)) return host;
+      continue;
+    }
+
+    try {
+      const resolved = await dns.lookup(host, { family: 4 });
+      if (resolved && resolved.address && isPrivateIpv4(resolved.address)) return resolved.address;
+    } catch (_) {
+      // Ignore DNS lookup failures and fall back to interface inspection.
+    }
+  }
+
+  return '';
+}
+
+function formatSmbShareDiscoveryError(error, username) {
+  const message = extractCommandErrorOutput(error) || String(error && error.message ? error.message : error || 'Unknown SMB error');
+  if (error && error.code === 'ENOENT') {
+    return 'SMB share browsing is unavailable because smbclient is not installed in the companion runtime.';
+  }
+  if (/SMB1 disabled -- no workgroup available/i.test(message)) {
+    return 'The SMB server responded, but workgroup enumeration failed after listing shares. Try again; if this persists, enter SMB credentials and browse the server directly.';
+  }
+  if (/STATUS_LOGON_FAILURE|STATUS_ACCESS_DENIED|NT_STATUS_ACCESS_DENIED|NT_STATUS_LOGON_FAILURE|invalid password/i.test(message)) {
+    return username
+      ? 'Authentication failed. Check the SMB username and password.'
+      : 'Anonymous SMB browsing was denied. Enter SMB credentials and try again.';
+  }
+  if (/STATUS_BAD_NETWORK_PATH|STATUS_HOST_UNREACHABLE|STATUS_NETWORK_NAME_DELETED|ETIMEDOUT|ECONNREFUSED|EHOSTUNREACH|ENOTFOUND/i.test(message)) {
+    return 'Unable to reach the SMB server.';
+  }
+  return message;
+}
+
+function formatNfsExportDiscoveryError(error) {
+  const message = extractCommandErrorOutput(error) || String(error && error.message ? error.message : error || 'Unknown NFS error');
+  if (/timed out|ECONNREFUSED|EHOSTUNREACH|ENOTFOUND|ENETUNREACH/i.test(message)) {
+    return 'Unable to reach the NFS server.';
+  }
+  return message;
+}
+
+async function listSmbServerShares(options) {
+  const host = String(options && options.host ? options.host : '').trim();
+  if (!host) throw new Error('SMB host is required.');
+
+  const username = String(options && options.username ? options.username : '').trim();
+  const password = typeof (options && options.password) === 'string' ? options.password : '';
+  const domain = String(options && options.domain ? options.domain : '').trim();
+  const port = normalizeOptionalPort(options && options.port, 445);
+  const args = ['-g', '-L', `//${host}`];
+
+  if (username) {
+    args.push('-U', `${username}%${password}`);
+  } else {
+    args.push('-N');
+  }
+  if (domain) {
+    args.push('-W', domain);
+  }
+  if (port !== 445) {
+    args.push('-p', String(port));
+  }
+
+  try {
+    const { stdout } = await execFileAsync('smbclient', args, {
+      timeout: NETWORK_SHARE_DISCOVERY_SMB_LIST_TIMEOUT_MS
+    });
+    return parseSmbClientShareList(stdout);
+  } catch (error) {
+    const fallbackShares = parseSmbClientShareList(error && error.stdout ? error.stdout : '');
+    if (fallbackShares.length > 0) {
+      return fallbackShares;
+    }
+    throw error;
+  }
+}
+
+async function discoverNetworkShareCandidates(req) {
+  const seedAddress = await resolveDiscoverySeedAddress(req);
+  const extraHosts = seedAddress ? [seedAddress] : [];
+  const networkInterfaces = seedAddress ? {} : os.networkInterfaces();
+  const targets = buildPrivateIpv4DiscoveryTargets(networkInterfaces, extraHosts);
+  const scannedSubnets = describePrivateIpv4Subnets(networkInterfaces, extraHosts);
+
+  if (targets.length === 0) {
+    throw new Error('Could not determine a private LAN subnet. Open SpatialFin Companion from a private IP address or browse a host manually.');
+  }
+
+  const warnings = [];
+  const warningSet = new Set();
+  const results = [];
+
+  await runWithConcurrency(targets, NETWORK_SHARE_DISCOVERY_CONCURRENCY, async (ip) => {
+    const [smbReachable, nfsReachable] = await Promise.all([
+      checkTcpPort(ip, 445, NETWORK_SHARE_DISCOVERY_CONNECT_TIMEOUT_MS).then(() => true).catch(() => false),
+      checkTcpPort(ip, 2049, NETWORK_SHARE_DISCOVERY_CONNECT_TIMEOUT_MS).then(() => true).catch(() => false)
+    ]);
+
+    if (smbReachable) {
+      results.push({
+        protocol: 'smb',
+        kind: 'server',
+        host: ip,
+        label: ip,
+        description: 'SMB server'
+      });
+    }
+
+    if (!nfsReachable) return;
+
+    const exportInfo = await queryNfsExports(ip);
+    if (Array.isArray(exportInfo.exports) && exportInfo.exports.length > 0) {
+      exportInfo.exports.forEach((exportPath) => {
+        results.push({
+          protocol: 'nfs',
+          kind: 'share',
+          host: ip,
+          shareName: exportPath,
+          label: exportPath,
+          description: 'NFS export'
+        });
+      });
+      return;
+    }
+
+    results.push({
+      protocol: 'nfs',
+      kind: 'server',
+      host: ip,
+      label: ip,
+      description: exportInfo.warning || 'NFS server'
+    });
+
+    if (exportInfo.warning) {
+      const warningMessage = `${ip}: ${exportInfo.warning}`;
+      if (!warningSet.has(warningMessage)) {
+        warningSet.add(warningMessage);
+        warnings.push(warningMessage);
+      }
+    }
+  });
+
+  return {
+    results: sortAndDedupeDiscoveryResults(results),
+    warnings,
+    scannedSubnets
+  };
 }
 
 async function testSmbShareConnection(share) {
@@ -1321,6 +1566,82 @@ adminRouter.post('/test-network-share', async (req, res) => {
       error: validation.share.protocol === 'nfs'
         ? formatNfsShareTestError(error)
         : formatSmbShareTestError(error)
+    });
+  }
+});
+
+adminRouter.post('/discover-network-shares', async (req, res) => {
+  try {
+    const discovery = await discoverNetworkShareCandidates(req);
+    res.json({
+      success: true,
+      results: discovery.results,
+      warnings: discovery.warnings,
+      scannedSubnets: discovery.scannedSubnets
+    });
+  } catch (error) {
+    res.json({
+      success: false,
+      error: error && error.message ? error.message : 'Network share discovery failed.'
+    });
+  }
+});
+
+adminRouter.post('/discover-smb-server-shares', async (req, res) => {
+  const payload = req.body || {};
+  const host = String(payload.host || '').trim();
+  if (!host) {
+    return res.json({
+      success: false,
+      error: 'SMB host is required.'
+    });
+  }
+
+  try {
+    const shares = await listSmbServerShares(payload);
+    res.json({
+      success: true,
+      host,
+      shares
+    });
+  } catch (error) {
+    res.json({
+      success: false,
+      error: formatSmbShareDiscoveryError(error, payload.username)
+    });
+  }
+});
+
+adminRouter.post('/discover-nfs-exports', async (req, res) => {
+  const payload = req.body || {};
+  const host = String(payload.host || '').trim();
+  if (!host) {
+    return res.json({
+      success: false,
+      error: 'NFS host is required.'
+    });
+  }
+
+  try {
+    await checkTcpPort(host, normalizeOptionalPort(payload.port, 2049));
+    const exportInfo = await queryNfsExports(host);
+    if ((!Array.isArray(exportInfo.exports) || exportInfo.exports.length === 0) && exportInfo.warning) {
+      return res.json({
+        success: false,
+        error: exportInfo.warning
+      });
+    }
+
+    res.json({
+      success: true,
+      host,
+      exports: exportInfo.exports,
+      warning: exportInfo.warning
+    });
+  } catch (error) {
+    res.json({
+      success: false,
+      error: formatNfsExportDiscoveryError(error)
     });
   }
 });

@@ -22,6 +22,36 @@ let autoScrollEnabled = true;
         let tokenRevealed = false;
         let actualToken = '';
         const dirtyState = {};
+        let shareDiscovery = createDefaultShareDiscoveryState();
+
+        function createDefaultShareDiscoveryState() {
+            return {
+                scanning: false,
+                hasScanned: false,
+                error: '',
+                warnings: [],
+                scannedSubnets: [],
+                results: [],
+                smbBrowser: {
+                    host: '',
+                    username: '',
+                    password: '',
+                    domain: '',
+                    loading: false,
+                    hasLoaded: false,
+                    error: '',
+                    shares: []
+                },
+                nfsBrowser: {
+                    host: '',
+                    loading: false,
+                    hasLoaded: false,
+                    error: '',
+                    warning: '',
+                    exports: []
+                }
+            };
+        }
 
         // ── Toast system ──
         function showToast(message, type) {
@@ -103,6 +133,30 @@ let autoScrollEnabled = true;
             el.classList.remove('invalid');
             var existing = el.parentNode.querySelector('.field-error');
             if (existing) existing.remove();
+        }
+
+        function escapeHtml(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function resetSmbBrowserResults() {
+            shareDiscovery.smbBrowser.hasLoaded = false;
+            shareDiscovery.smbBrowser.loading = false;
+            shareDiscovery.smbBrowser.error = '';
+            shareDiscovery.smbBrowser.shares = [];
+        }
+
+        function resetNfsBrowserResults() {
+            shareDiscovery.nfsBrowser.hasLoaded = false;
+            shareDiscovery.nfsBrowser.loading = false;
+            shareDiscovery.nfsBrowser.error = '';
+            shareDiscovery.nfsBrowser.warning = '';
+            shareDiscovery.nfsBrowser.exports = [];
         }
 
         // ── Language selects ──
@@ -1271,6 +1325,277 @@ let autoScrollEnabled = true;
             wrapPasswordInputs();
         }
 
+        function addDiscoveredSmbShare(host, shareName) {
+            if (!configData || !configData.networkShares) return;
+            configData.networkShares.push({
+                id: Math.random().toString(36).substr(2, 9),
+                protocol: 'smb',
+                host: host || '',
+                shareName: shareName || '',
+                path: '',
+                displayName: shareName || host || 'New Share',
+                username: shareDiscovery.smbBrowser.username || '',
+                password: shareDiscovery.smbBrowser.password || '',
+                domain: shareDiscovery.smbBrowser.domain || '',
+                addedAtEpochMs: Date.now()
+            });
+            renderShares();
+            updateStats();
+            markDirty('network-shares');
+            showToast('SMB share added to the configuration.', 'success');
+        }
+
+        function addDiscoveredNfsShare(host, exportPath) {
+            if (!configData || !configData.networkShares) return;
+            configData.networkShares.push({
+                id: Math.random().toString(36).substr(2, 9),
+                protocol: 'nfs',
+                host: host || '',
+                shareName: exportPath || '',
+                path: '',
+                displayName: exportPath || host || 'New Share',
+                username: '',
+                password: '',
+                addedAtEpochMs: Date.now()
+            });
+            renderShares();
+            updateStats();
+            markDirty('network-shares');
+            showToast('NFS export added to the configuration.', 'success');
+        }
+
+        async function discoverNetworkShares() {
+            shareDiscovery.scanning = true;
+            shareDiscovery.hasScanned = true;
+            shareDiscovery.error = '';
+            shareDiscovery.warnings = [];
+            shareDiscovery.results = [];
+            shareDiscovery.scannedSubnets = [];
+            renderShareDiscoveryPanel();
+
+            try {
+                var res = await fetch('/api/admin/discover-network-shares', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({})
+                });
+                var data = await res.json();
+                if (res.ok && data.success) {
+                    shareDiscovery.results = Array.isArray(data.results) ? data.results : [];
+                    shareDiscovery.warnings = Array.isArray(data.warnings) ? data.warnings : [];
+                    shareDiscovery.scannedSubnets = Array.isArray(data.scannedSubnets) ? data.scannedSubnets : [];
+                } else {
+                    shareDiscovery.error = data.error || 'Network share discovery failed.';
+                }
+            } catch (e) {
+                shareDiscovery.error = e.message || 'Network share discovery failed.';
+            } finally {
+                shareDiscovery.scanning = false;
+                renderShareDiscoveryPanel();
+            }
+        }
+
+        async function browseSmbServer(host) {
+            if (typeof host === 'string' && host) {
+                shareDiscovery.smbBrowser.host = host;
+            }
+            resetSmbBrowserResults();
+            shareDiscovery.smbBrowser.loading = true;
+            renderShareDiscoveryPanel();
+
+            try {
+                var res = await fetch('/api/admin/discover-smb-server-shares', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        host: shareDiscovery.smbBrowser.host,
+                        username: shareDiscovery.smbBrowser.username,
+                        password: shareDiscovery.smbBrowser.password,
+                        domain: shareDiscovery.smbBrowser.domain
+                    })
+                });
+                var data = await res.json();
+                if (res.ok && data.success) {
+                    shareDiscovery.smbBrowser.shares = Array.isArray(data.shares) ? data.shares : [];
+                    shareDiscovery.smbBrowser.hasLoaded = true;
+                } else {
+                    shareDiscovery.smbBrowser.error = data.error || 'SMB share browsing failed.';
+                }
+            } catch (e) {
+                shareDiscovery.smbBrowser.error = e.message || 'SMB share browsing failed.';
+            } finally {
+                shareDiscovery.smbBrowser.loading = false;
+                renderShareDiscoveryPanel();
+            }
+        }
+
+        async function browseNfsExports(host) {
+            if (typeof host === 'string' && host) {
+                shareDiscovery.nfsBrowser.host = host;
+            }
+            resetNfsBrowserResults();
+            shareDiscovery.nfsBrowser.loading = true;
+            renderShareDiscoveryPanel();
+
+            try {
+                var res = await fetch('/api/admin/discover-nfs-exports', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        host: shareDiscovery.nfsBrowser.host
+                    })
+                });
+                var data = await res.json();
+                if (res.ok && data.success) {
+                    shareDiscovery.nfsBrowser.exports = Array.isArray(data.exports) ? data.exports : [];
+                    shareDiscovery.nfsBrowser.warning = data.warning || '';
+                    shareDiscovery.nfsBrowser.hasLoaded = true;
+                } else {
+                    shareDiscovery.nfsBrowser.error = data.error || 'NFS export browsing failed.';
+                }
+            } catch (e) {
+                shareDiscovery.nfsBrowser.error = e.message || 'NFS export browsing failed.';
+            } finally {
+                shareDiscovery.nfsBrowser.loading = false;
+                renderShareDiscoveryPanel();
+            }
+        }
+
+        function renderShareDiscoveryPanel() {
+            var panel = document.getElementById('share-discovery-panel');
+            if (!panel) return;
+
+            if (!configData) {
+                panel.innerHTML = '';
+                return;
+            }
+
+            var scanSummary = '';
+            if (shareDiscovery.scannedSubnets.length > 0) {
+                scanSummary = '<div class="discovery-summary">Scanned: ' + escapeHtml(shareDiscovery.scannedSubnets.join(', ')) + '</div>';
+            }
+
+            var warningHtml = '';
+            if (shareDiscovery.warnings.length > 0) {
+                warningHtml = '<div class="discovery-warning">' + shareDiscovery.warnings.map(function(item) {
+                    return '<div>' + escapeHtml(item) + '</div>';
+                }).join('') + '</div>';
+            }
+
+            var resultsHtml = '';
+            if (shareDiscovery.scanning) {
+                resultsHtml = '<div class="discovery-empty">Scanning the local network for SMB and NFS services...</div>';
+            } else if (shareDiscovery.error) {
+                resultsHtml = '<div class="discovery-error">' + escapeHtml(shareDiscovery.error) + '</div>';
+            } else if (shareDiscovery.hasScanned && shareDiscovery.results.length === 0) {
+                resultsHtml = '<div class="discovery-empty">No SMB servers or NFS exports were discovered automatically. You can still browse a host manually below.</div>';
+            } else if (shareDiscovery.results.length > 0) {
+                resultsHtml = '<div class="discovery-result-list">' + shareDiscovery.results.map(function(result) {
+                    var actionHtml = '';
+                    if (result.protocol === 'smb') {
+                        actionHtml = '<button class="secondary" onclick=\'browseSmbServer(' + JSON.stringify(result.host || '') + ')\'>Browse Shares</button>';
+                    } else if (result.shareName) {
+                        actionHtml = '<button onclick=\'addDiscoveredNfsShare(' + JSON.stringify(result.host || '') + ',' + JSON.stringify(result.shareName || '') + ')\'>Add Export</button>';
+                    } else {
+                        actionHtml = '<button class="secondary" onclick=\'browseNfsExports(' + JSON.stringify(result.host || '') + ')\'>Browse Exports</button>';
+                    }
+
+                    return '<div class="discovery-result-card">' +
+                        '<div>' +
+                        '<div class="discovery-result-title">' + escapeHtml(result.shareName || result.label || result.host || '') + '</div>' +
+                        '<div class="discovery-result-subtitle">' + escapeHtml(result.protocol.toUpperCase() + ' • ' + (result.host || '')) + '</div>' +
+                        (result.description ? '<div class="discovery-result-meta">' + escapeHtml(result.description) + '</div>' : '') +
+                        '</div>' +
+                        '<div class="discovery-result-actions">' + actionHtml + '</div>' +
+                        '</div>';
+                }).join('') + '</div>';
+            }
+
+            var smbResultsHtml = '';
+            if (shareDiscovery.smbBrowser.loading) {
+                smbResultsHtml = '<div class="discovery-empty">Loading SMB shares...</div>';
+            } else if (shareDiscovery.smbBrowser.error) {
+                smbResultsHtml = '<div class="discovery-error">' + escapeHtml(shareDiscovery.smbBrowser.error) + '</div>';
+            } else if (shareDiscovery.smbBrowser.hasLoaded && shareDiscovery.smbBrowser.shares.length === 0) {
+                smbResultsHtml = '<div class="discovery-empty">No browsable SMB shares were returned for that server.</div>';
+            } else if (shareDiscovery.smbBrowser.shares.length > 0) {
+                smbResultsHtml = '<div class="discovery-result-list">' + shareDiscovery.smbBrowser.shares.map(function(share) {
+                    return '<div class="discovery-result-card">' +
+                        '<div>' +
+                        '<div class="discovery-result-title">' + escapeHtml(share.name || '') + '</div>' +
+                        (share.description ? '<div class="discovery-result-meta">' + escapeHtml(share.description) + '</div>' : '') +
+                        '</div>' +
+                        '<div class="discovery-result-actions">' +
+                        '<button onclick=\'addDiscoveredSmbShare(' + JSON.stringify(shareDiscovery.smbBrowser.host || '') + ',' + JSON.stringify(share.name || '') + ')\'>Use Share</button>' +
+                        '</div>' +
+                        '</div>';
+                }).join('') + '</div>';
+            }
+
+            var nfsResultsHtml = '';
+            if (shareDiscovery.nfsBrowser.loading) {
+                nfsResultsHtml = '<div class="discovery-empty">Loading NFS exports...</div>';
+            } else if (shareDiscovery.nfsBrowser.error) {
+                nfsResultsHtml = '<div class="discovery-error">' + escapeHtml(shareDiscovery.nfsBrowser.error) + '</div>';
+            } else if (shareDiscovery.nfsBrowser.hasLoaded && shareDiscovery.nfsBrowser.exports.length === 0) {
+                nfsResultsHtml = '<div class="discovery-empty">No exported NFS paths were returned for that host.</div>';
+            } else if (shareDiscovery.nfsBrowser.exports.length > 0) {
+                nfsResultsHtml = '<div class="discovery-result-list">' + shareDiscovery.nfsBrowser.exports.map(function(exportPath) {
+                    return '<div class="discovery-result-card">' +
+                        '<div>' +
+                        '<div class="discovery-result-title">' + escapeHtml(exportPath) + '</div>' +
+                        '<div class="discovery-result-subtitle">' + escapeHtml(shareDiscovery.nfsBrowser.host || '') + '</div>' +
+                        '</div>' +
+                        '<div class="discovery-result-actions">' +
+                        '<button onclick=\'addDiscoveredNfsShare(' + JSON.stringify(shareDiscovery.nfsBrowser.host || '') + ',' + JSON.stringify(exportPath || '') + ')\'>Use Export</button>' +
+                        '</div>' +
+                        '</div>';
+                }).join('') + '</div>';
+            }
+
+            panel.innerHTML =
+                '<div class="card discovery-card">' +
+                '<div class="discovery-header">' +
+                '<div>' +
+                '<div class="discovery-title">Discover Shares</div>' +
+                '<div class="discovery-copy">Scan the local network, then select an SMB share or NFS export instead of typing it manually.</div>' +
+                '</div>' +
+                '<button onclick="discoverNetworkShares()"' + (shareDiscovery.scanning ? ' disabled' : '') + '>' + (shareDiscovery.scanning ? 'Scanning...' : 'Scan Local Network') + '</button>' +
+                '</div>' +
+                scanSummary +
+                warningHtml +
+                resultsHtml +
+                '<div class="discovery-browser-grid">' +
+                '<div class="discovery-browser">' +
+                '<div class="discovery-browser-title">Browse SMB Server</div>' +
+                '<div class="discovery-form-grid">' +
+                '<div><label class="setting-label">Host / IP</label><input type="text" value="' + escapeHtml(shareDiscovery.smbBrowser.host) + '" onchange="shareDiscovery.smbBrowser.host=this.value;resetSmbBrowserResults()" style="width: 100%;"></div>' +
+                '<div><label class="setting-label">Username</label><input type="text" value="' + escapeHtml(shareDiscovery.smbBrowser.username) + '" onchange="shareDiscovery.smbBrowser.username=this.value;resetSmbBrowserResults()" style="width: 100%;"></div>' +
+                '<div><label class="setting-label">Password</label><input type="password" value="' + escapeHtml(shareDiscovery.smbBrowser.password) + '" onchange="shareDiscovery.smbBrowser.password=this.value;resetSmbBrowserResults()" style="width: 100%;"></div>' +
+                '<div><label class="setting-label">Domain</label><input type="text" value="' + escapeHtml(shareDiscovery.smbBrowser.domain) + '" onchange="shareDiscovery.smbBrowser.domain=this.value;resetSmbBrowserResults()" style="width: 100%;"></div>' +
+                '</div>' +
+                '<div class="discovery-actions">' +
+                '<button class="secondary" onclick="browseSmbServer()"' + ((!shareDiscovery.smbBrowser.host || shareDiscovery.smbBrowser.loading) ? ' disabled' : '') + '>' + (shareDiscovery.smbBrowser.loading ? 'Browsing...' : 'List SMB Shares') + '</button>' +
+                '</div>' +
+                smbResultsHtml +
+                '</div>' +
+                '<div class="discovery-browser">' +
+                '<div class="discovery-browser-title">Browse NFS Exports</div>' +
+                '<div class="discovery-form-grid single-column">' +
+                '<div><label class="setting-label">Host / IP</label><input type="text" value="' + escapeHtml(shareDiscovery.nfsBrowser.host) + '" onchange="shareDiscovery.nfsBrowser.host=this.value;resetNfsBrowserResults()" style="width: 100%;"></div>' +
+                '</div>' +
+                '<div class="discovery-actions">' +
+                '<button class="secondary" onclick="browseNfsExports()"' + ((!shareDiscovery.nfsBrowser.host || shareDiscovery.nfsBrowser.loading) ? ' disabled' : '') + '>' + (shareDiscovery.nfsBrowser.loading ? 'Browsing...' : 'List NFS Exports') + '</button>' +
+                '</div>' +
+                (shareDiscovery.nfsBrowser.warning ? '<div class="discovery-summary">' + escapeHtml(shareDiscovery.nfsBrowser.warning) + '</div>' : '') +
+                nfsResultsHtml +
+                '</div>' +
+                '</div>' +
+                '</div>';
+
+            wrapPasswordInputs();
+        }
+
         function renderShares() {
             var container = document.getElementById('share-container');
             container.innerHTML = "";
@@ -1447,6 +1772,7 @@ let autoScrollEnabled = true;
         async function loadConfig() {
             var res = await fetch('/api/admin/config');
             configData = await res.json();
+            shareDiscovery = createDefaultShareDiscoveryState();
 
             document.querySelectorAll('.lang-select').forEach(function(el) { populateLanguageSelect(el.id); });
 
@@ -1471,6 +1797,7 @@ let autoScrollEnabled = true;
 
             updateStats();
             renderServers();
+            renderShareDiscoveryPanel();
             renderShares();
             loadQR();
             wrapPasswordInputs();
