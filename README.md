@@ -72,7 +72,7 @@ If you remove `./data/`, you lose the active config database, event history, sna
 ## How It Works
 
 1. Open the dashboard and configure your Jellyfin servers, verified users, and any network shares.
-2. Adjust global settings such as language behavior, playback defaults, voice assistant options, Seerr, TMDB, AI keys, and diagnostics.
+2. Adjust global settings such as language behavior, playback defaults, voice assistant options, Seerr, TMDB, OMDb, AI keys, and diagnostics.
 3. Open SpatialFin on the headset and scan the QR code from the dashboard during onboarding, or from the in-app SpatialFin Companion settings later.
 4. The headset syncs the companion config using the embedded setup token.
 5. If companion logging is enabled, new log lines from SpatialFin are uploaded back to the companion and become visible in the `Device Logs` section.
