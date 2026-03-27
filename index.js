@@ -44,9 +44,9 @@ const {
   isPrivateIpv4,
   validateTvPairingPayload,
   validateTvPairingInfo,
-  getPrivateIpv4ScanTargets,
   buildTvReceiverUrl,
   buildTvInfoUrl,
+  normalizeTvReceiverInput,
   buildTvPairingEnvelope
 } = require('./tv-pairing');
 
@@ -1132,13 +1132,23 @@ async function mapWithConcurrency(items, concurrency, worker) {
   return results;
 }
 
-function getTvDiscoveryTargets() {
-  return getPrivateIpv4ScanTargets(os.networkInterfaces());
+async function resolveTvDiscoveryPlan(req) {
+  const seedAddress = await resolveDiscoverySeedAddress(req);
+  const extraHosts = seedAddress ? [seedAddress] : [];
+  const networkInterfaces = seedAddress ? {} : os.networkInterfaces();
+  const ips = buildPrivateIpv4DiscoveryTargets(networkInterfaces, extraHosts);
+
+  return {
+    targets: ips,
+    scannedSubnets: describePrivateIpv4Subnets(networkInterfaces, extraHosts)
+  };
 }
 
-async function fetchTvPairingCandidate(target) {
+async function fetchTvPairingCandidate(ip, receiverUrlOverride) {
   try {
-    const result = await httpGet(buildTvInfoUrl(target.ip), {}, TV_PAIRING_DISCOVERY_TIMEOUT_MS);
+    const receiverUrl = receiverUrlOverride || buildTvReceiverUrl(ip);
+    const infoUrl = receiverUrlOverride ? normalizeTvReceiverInput(receiverUrlOverride).infoUrl : buildTvInfoUrl(ip);
+    const result = await httpGet(infoUrl, {}, TV_PAIRING_DISCOVERY_TIMEOUT_MS);
     if (result.status !== 200 || !result.data || typeof result.data !== 'object') {
       return null;
     }
@@ -1147,13 +1157,11 @@ async function fetchTvPairingCandidate(target) {
       return null;
     }
     return {
-      interfaceName: target.interfaceName,
-      sourceAddress: target.sourceAddress,
-      ip: target.ip,
-      receiver_url: buildTvReceiverUrl(target.ip),
+      ip,
+      receiver_url: receiverUrl,
       version: validated.info.version,
       manual_code: validated.info.manual_code,
-      device_name: validated.info.device_name || `TV ${target.ip}`,
+      device_name: validated.info.device_name || `TV ${ip}`,
       expires_at_epoch_ms: validated.info.expires_at_epoch_ms,
       pairing_token: validated.info.pairing_token || ''
     };
@@ -1162,46 +1170,99 @@ async function fetchTvPairingCandidate(target) {
   }
 }
 
-async function discoverTvCandidates(manualCode) {
+async function discoverTvCandidates(req, manualCode) {
   const normalizedCode = normalizeManualCode(manualCode);
   if (!normalizedCode || normalizedCode.length !== 6) {
     return { error: 'invalid_code', message: 'Enter the 6-character TV code.', candidates: [] };
   }
 
-  const targets = getTvDiscoveryTargets();
-  if (!targets.length) {
+  const discoveryPlan = await resolveTvDiscoveryPlan(req);
+  if (!discoveryPlan.targets.length) {
     return { error: 'local_network_unavailable', message: 'No private local network was found on the companion host.', candidates: [] };
   }
 
-  console.info('TV pairing discovery started:', { targetCount: targets.length, codePrefix: normalizedCode.slice(0, 3) });
-  const scanned = await mapWithConcurrency(targets, TV_PAIRING_DISCOVERY_CONCURRENCY, fetchTvPairingCandidate);
+  console.info('TV pairing discovery started:', {
+    targetCount: discoveryPlan.targets.length,
+    codePrefix: normalizedCode.slice(0, 3),
+    scannedSubnets: discoveryPlan.scannedSubnets
+  });
+  const scanned = await mapWithConcurrency(discoveryPlan.targets, TV_PAIRING_DISCOVERY_CONCURRENCY, fetchTvPairingCandidate);
   const candidates = scanned.filter(Boolean).filter((entry) => entry.manual_code === normalizedCode);
   const now = Date.now();
   const activeCandidates = candidates.filter((entry) => Number(entry.expires_at_epoch_ms) > now);
 
   console.info('TV pairing discovery completed:', {
-    targetCount: targets.length,
+    targetCount: discoveryPlan.targets.length,
     respondingCount: scanned.filter(Boolean).length,
     matchedCount: candidates.length,
-    activeCount: activeCandidates.length
+    activeCount: activeCandidates.length,
+    scannedSubnets: discoveryPlan.scannedSubnets
   });
 
   if (activeCandidates.length > 0) {
-    return { candidates: activeCandidates, scannedCount: targets.length };
+    return { candidates: activeCandidates, scannedCount: discoveryPlan.targets.length };
   }
   if (candidates.length > 0) {
     return {
       error: 'expired_code',
       message: 'That TV code has expired. Start pairing again on the TV and try once more.',
       candidates,
-      scannedCount: targets.length
+      scannedCount: discoveryPlan.targets.length
     };
   }
   return {
     error: 'code_not_found',
     message: 'No TV on the local network matched that code.',
     candidates: [],
-    scannedCount: targets.length
+    scannedCount: discoveryPlan.targets.length
+  };
+}
+
+async function lookupTvCandidateByReceiverUrl(receiverInput, manualCode) {
+  const normalizedCode = normalizeManualCode(manualCode);
+  if (!normalizedCode || normalizedCode.length !== 6) {
+    return {
+      error: 'invalid_code',
+      message: 'Enter the 6-character TV code.'
+    };
+  }
+
+  const receiver = normalizeTvReceiverInput(receiverInput);
+  if (!receiver.ok) {
+    return {
+      error: 'invalid_receiver_url',
+      message: receiver.issues[0] || 'Enter the TV receiver URL shown on the TV.'
+    };
+  }
+
+  let candidate;
+  try {
+    candidate = await fetchTvPairingCandidate(receiver.host || 'TV', receiver.receiverUrl);
+  } catch (_) {
+    candidate = null;
+  }
+
+  if (!candidate) {
+    return {
+      error: 'tv_unreachable',
+      message: 'The TV could not be reached at that receiver URL.'
+    };
+  }
+  if (candidate.manual_code !== normalizedCode) {
+    return {
+      error: 'code_not_found',
+      message: 'That TV URL responded, but the 6-character code did not match.'
+    };
+  }
+  if (Number(candidate.expires_at_epoch_ms) <= Date.now()) {
+    return {
+      error: 'expired_code',
+      message: 'That TV code has expired. Start pairing again on the TV and try once more.',
+      candidate
+    };
+  }
+  return {
+    candidate
   };
 }
 
@@ -1211,7 +1272,7 @@ function buildTvPairingError(result, usedManualCodeFallback) {
     if (usedManualCodeFallback) {
       return {
         error: 'invalid_pairing_token',
-        message: 'The TV rejected manual-code pairing. This TV build still requires the hidden full pairing token for manual pairing.'
+        message: 'The TV rejected the 6-character pairing code. Refresh the code on the TV and try again.'
       };
     }
     return {
@@ -1382,7 +1443,7 @@ adminRouter.get('/qr', async (req, res) => {
 adminRouter.post('/tv-pairing/discover', async (req, res) => {
   try {
     const manualCode = normalizeManualCode(req.body && req.body.manualCode);
-    const result = await discoverTvCandidates(manualCode);
+    const result = await discoverTvCandidates(req, manualCode);
     if (result.error === 'invalid_code') {
       return res.status(400).json(result);
     }
@@ -1404,6 +1465,35 @@ adminRouter.post('/tv-pairing/discover', async (req, res) => {
     res.status(500).json({
       error: 'discovery_failed',
       message: 'TV discovery failed.'
+    });
+  }
+});
+
+adminRouter.post('/tv-pairing/resolve', async (req, res) => {
+  try {
+    const receiverUrl = req.body && req.body.receiverUrl;
+    const manualCode = normalizeManualCode(req.body && req.body.manualCode);
+    const result = await lookupTvCandidateByReceiverUrl(receiverUrl, manualCode);
+    if (result.error === 'invalid_code' || result.error === 'invalid_receiver_url') {
+      return res.status(400).json(result);
+    }
+    if (result.error === 'expired_code') {
+      return res.status(410).json(result);
+    }
+    if (result.error === 'code_not_found') {
+      return res.status(404).json(result);
+    }
+    if (result.error === 'tv_unreachable') {
+      return res.status(504).json(result);
+    }
+    res.json({
+      candidate: result.candidate
+    });
+  } catch (error) {
+    console.warn('TV pairing direct lookup failed:', error.message);
+    res.status(500).json({
+      error: 'lookup_failed',
+      message: 'TV lookup failed.'
     });
   }
 });
