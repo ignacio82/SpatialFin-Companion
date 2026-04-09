@@ -27,6 +27,96 @@ function buildTvInfoUrl(host) {
   return `http://${host}:${TV_PAIRING_PORT}${TV_PAIRING_INFO_PATH}`;
 }
 
+function buildTvInfoUrlFromReceiverUrl(receiverUrl) {
+  const parsed = new URL(String(receiverUrl || '').trim());
+  parsed.pathname = TV_PAIRING_INFO_PATH;
+  parsed.search = '';
+  parsed.hash = '';
+  return parsed.toString();
+}
+
+function normalizeTvReceiverPath(pathname) {
+  const rawPath = String(pathname || '').trim();
+  if (!rawPath || rawPath === '/') {
+    return {
+      ok: true,
+      receiverPath: TV_PAIRING_CONFIG_PATH
+    };
+  }
+
+  const normalizedPath = rawPath.replace(/\/+$/, '') || '/';
+  if (normalizedPath === TV_PAIRING_CONFIG_PATH) {
+    return {
+      ok: true,
+      receiverPath: TV_PAIRING_CONFIG_PATH
+    };
+  }
+  if (normalizedPath === TV_PAIRING_INFO_PATH) {
+    return {
+      ok: true,
+      receiverPath: TV_PAIRING_CONFIG_PATH
+    };
+  }
+
+  return {
+    ok: false,
+    message: `TV receiver URL must use ${TV_PAIRING_CONFIG_PATH} or ${TV_PAIRING_INFO_PATH}`
+  };
+}
+
+function normalizeTvReceiverInput(input) {
+  const raw = String(input || '').trim();
+  if (!raw) {
+    return {
+      ok: false,
+      issues: ['Missing TV receiver URL'],
+      receiverUrl: '',
+      infoUrl: '',
+      host: ''
+    };
+  }
+
+  const withProtocol = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+  let parsed;
+  try {
+    parsed = new URL(withProtocol);
+  } catch (_) {
+    return {
+      ok: false,
+      issues: ['TV receiver URL is invalid'],
+      receiverUrl: '',
+      infoUrl: '',
+      host: ''
+    };
+  }
+
+  const issues = [];
+  if (!/^https?:$/i.test(parsed.protocol)) {
+    issues.push('TV receiver URL must use HTTP or HTTPS');
+  }
+  if (!parsed.port) {
+    parsed.port = String(TV_PAIRING_PORT);
+  }
+
+  const normalizedPath = normalizeTvReceiverPath(parsed.pathname);
+  if (!normalizedPath.ok) {
+    issues.push(normalizedPath.message);
+  } else {
+    parsed.pathname = normalizedPath.receiverPath;
+  }
+  parsed.search = '';
+  parsed.hash = '';
+
+  const receiverUrl = parsed.toString();
+  return {
+    ok: issues.length === 0,
+    issues,
+    receiverUrl,
+    infoUrl: issues.length === 0 ? buildTvInfoUrlFromReceiverUrl(receiverUrl) : '',
+    host: parsed.hostname
+  };
+}
+
 function normalizeTvPairingPayload(input) {
   const payload = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
   return {
@@ -141,6 +231,8 @@ module.exports = {
   isPrivateIpv4,
   buildTvReceiverUrl,
   buildTvInfoUrl,
+  buildTvInfoUrlFromReceiverUrl,
+  normalizeTvReceiverInput,
   normalizeTvPairingPayload,
   validateTvPairingPayload,
   normalizeTvPairingInfo,

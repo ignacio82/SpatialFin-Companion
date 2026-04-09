@@ -120,17 +120,20 @@
         var target = state.mode === 'qr' ? state.pendingPayload : state.selectedCandidate;
         if (!card || !target) return;
 
+        var pairingLabel = state.mode === 'qr'
+            ? 'QR Pairing'
+            : (state.sourceStep === 'direct' ? 'TV URL' : 'Manual Code');
         var detailLines = [];
         if (target.device_name) detailLines.push('Device: ' + target.device_name);
         if (target.ip) detailLines.push('IP: ' + target.ip);
         if (target.receiver_url) detailLines.push('Receiver: ' + target.receiver_url);
         detailLines.push('Expires: ' + formatExpiry(target.expires_at_epoch_ms));
         if (state.mode === 'manual' && !target.pairing_token) {
-            detailLines.push('Note: this TV did not expose a pairing token via the manual discovery endpoint. Pairing may be rejected unless the TV accepts manual-code fallback.');
+            detailLines.push('Note: this TV will use the 6-character code as the pairing credential.');
         }
 
         card.innerHTML =
-            '<div class="tv-pairing-badge">' + escapeHtml(state.mode === 'qr' ? 'QR Pairing' : 'Manual Code') + '</div>' +
+            '<div class="tv-pairing-badge">' + escapeHtml(pairingLabel) + '</div>' +
             '<h3 style="margin:14px 0 10px 0;">' + escapeHtml(target.device_name || 'TV') + '</h3>' +
             '<div class="tv-pairing-confirm-meta">' + escapeHtml(detailLines.join(' • ')) + '</div>' +
             '<p class="tv-pairing-help" style="margin-bottom:0;">Send the current SpatialFin Companion configuration to this TV?</p>';
@@ -146,11 +149,11 @@
     async function startTvQrScanner() {
         clearTvPairingError();
         if (!window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
-            setTvPairingError('Camera access requires HTTPS or localhost. Use Enter TV Code instead.');
+            setTvPairingError('Camera access requires HTTPS or localhost. Use Enter TV Code or Use TV URL instead.');
             return;
         }
         if (!('BarcodeDetector' in window) || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-            setTvPairingError('QR scanning is not supported in this browser. Use Enter TV Code instead.');
+            setTvPairingError('QR scanning is not supported in this browser. Use Enter TV Code or Use TV URL instead.');
             return;
         }
 
@@ -163,7 +166,7 @@
             if (window.BarcodeDetector.getSupportedFormats) {
                 var formats = await window.BarcodeDetector.getSupportedFormats();
                 if (Array.isArray(formats) && formats.indexOf('qr_code') === -1) {
-                    setTvPairingError('This browser does not expose QR detection. Use Enter TV Code instead.');
+                    setTvPairingError('This browser does not expose QR detection. Use Enter TV Code or Use TV URL instead.');
                     return;
                 }
             }
@@ -267,6 +270,7 @@
         state.pendingPayload = null;
         state.selectedCandidate = null;
         state.mode = null;
+        state.sourceStep = 'home';
         showTvPairingStep(initialStep || 'home');
     };
 
@@ -279,6 +283,7 @@
         state.selectedCandidate = null;
         state.mode = null;
         state.busy = false;
+        state.sourceStep = 'home';
     };
 
     window.showTvPairingStep = function(step) {
@@ -299,6 +304,12 @@
             state.sourceStep = 'manual';
             setTvPairingSubtitle('Enter the TV code and search the local network for matching TVs.');
             updateTvPairingSteps('manual');
+            return;
+        }
+        if (step === 'direct') {
+            state.sourceStep = 'direct';
+            setTvPairingSubtitle('Enter the TV receiver URL and the 6-character code shown on the TV.');
+            updateTvPairingSteps('direct');
             return;
         }
         if (step === 'confirm') {
@@ -379,7 +390,59 @@
             showTvPairingStep('scan');
             return;
         }
+        if (state.sourceStep === 'direct') {
+            showTvPairingStep('direct');
+            return;
+        }
         showTvPairingStep('manual');
+    };
+
+    window.resolveTvByReceiverUrl = async function() {
+        clearTvPairingError();
+        state.selectedCandidate = null;
+
+        var receiverInput = el('tv-direct-receiver-input');
+        var codeInput = el('tv-direct-code-input');
+        var receiverUrl = receiverInput && receiverInput.value ? receiverInput.value.trim() : '';
+        var manualCode = normalizeManualCode(codeInput && codeInput.value);
+        if (codeInput) codeInput.value = manualCode;
+
+        if (!receiverUrl) {
+            setTvPairingError('Enter the TV receiver URL shown on the TV.');
+            return;
+        }
+        if (manualCode.length !== 6) {
+            setTvPairingError('Enter the full 6-character TV code.');
+            return;
+        }
+
+        try {
+            var res = await fetch('/api/admin/tv-pairing/resolve', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    receiverUrl: receiverUrl,
+                    manualCode: manualCode
+                })
+            });
+            var data = await res.json();
+            if (!res.ok) {
+                setTvPairingError(data.message || 'TV lookup failed.');
+                return;
+            }
+
+            state.mode = 'manual';
+            state.sourceStep = 'direct';
+            state.selectedCandidate = data.candidate || null;
+            if (!state.selectedCandidate) {
+                throw new Error('The TV lookup did not return a candidate.');
+            }
+            renderTvPairingConfirmation();
+            setTvPairingSubtitle('Confirm the TV before sending the current companion config.');
+            updateTvPairingSteps('confirm');
+        } catch (error) {
+            setTvPairingError('TV lookup failed: ' + (error.message || 'unknown error'));
+        }
     };
 
     window.confirmTvPairing = async function() {
@@ -437,6 +500,23 @@
             });
             input.addEventListener('keydown', function(event) {
                 if (event.key === 'Enter') discoverTvByManualCode();
+            });
+        }
+
+        var directCodeInput = el('tv-direct-code-input');
+        if (directCodeInput) {
+            directCodeInput.addEventListener('input', function() {
+                directCodeInput.value = normalizeManualCode(directCodeInput.value);
+            });
+            directCodeInput.addEventListener('keydown', function(event) {
+                if (event.key === 'Enter') resolveTvByReceiverUrl();
+            });
+        }
+
+        var directReceiverInput = el('tv-direct-receiver-input');
+        if (directReceiverInput) {
+            directReceiverInput.addEventListener('keydown', function(event) {
+                if (event.key === 'Enter') resolveTvByReceiverUrl();
             });
         }
 

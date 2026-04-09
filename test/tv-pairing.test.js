@@ -3,10 +3,12 @@ const assert = require('node:assert/strict');
 
 const {
   normalizeManualCode,
+  normalizeTvReceiverInput,
   validateTvPairingPayload,
   validateTvPairingInfo,
   getPrivateIpv4ScanTargets,
   buildTvReceiverUrl,
+  buildTvInfoUrlFromReceiverUrl,
   buildTvPairingEnvelope
 } = require('../tv-pairing');
 
@@ -55,6 +57,24 @@ test('validateTvPairingInfo accepts optional pairing token extension', () => {
   assert.equal(result.ok, true);
   assert.equal(result.info.manual_code, 'Q1W2E3');
   assert.equal(result.info.pairing_token, 'optional-secret');
+});
+
+test('normalizeTvReceiverInput accepts a bare host and expands it to the TV config endpoint', () => {
+  const result = normalizeTvReceiverInput('192.168.1.25');
+
+  assert.equal(result.ok, true);
+  assert.equal(result.receiverUrl, 'http://192.168.1.25:41230/api/v1/tv-pairing/config');
+  assert.equal(result.infoUrl, 'http://192.168.1.25:41230/api/v1/tv-pairing/info');
+  assert.equal(result.host, '192.168.1.25');
+});
+
+test('normalizeTvReceiverInput converts the info endpoint back to the config endpoint', () => {
+  const result = normalizeTvReceiverInput('http://living-room-tv:41230/api/v1/tv-pairing/info');
+
+  assert.equal(result.ok, true);
+  assert.equal(result.receiverUrl, 'http://living-room-tv:41230/api/v1/tv-pairing/config');
+  assert.equal(result.infoUrl, 'http://living-room-tv:41230/api/v1/tv-pairing/info');
+  assert.equal(buildTvInfoUrlFromReceiverUrl(result.receiverUrl), result.infoUrl);
 });
 
 test('getPrivateIpv4ScanTargets expands private /24 ranges and skips self', () => {

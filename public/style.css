@@ -1380,10 +1380,23 @@
     display: block;
 }
 
+.tv-pairing-step .setting-label {
+    display: block;
+    margin-bottom: 8px;
+}
+
+.tv-pairing-step input + .setting-label {
+    margin-top: 14px;
+}
+
 .tv-pairing-option-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 14px;
+}
+
+.tv-pairing-option-grid > :last-child:nth-child(odd) {
+    grid-column: 1 / -1;
 }
 
 .tv-pairing-option {

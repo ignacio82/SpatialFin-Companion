@@ -748,6 +748,10 @@
                         <span>Enter TV Code</span>
                         <small>Discover TVs on your local network and match the 6-character code.</small>
                     </button>
+                    <button class="tv-pairing-option" onclick="showTvPairingStep('direct')">
+                        <span>Use TV URL</span>
+                        <small>Type the receiver URL and code shown on the TV when camera access or auto-discovery is unavailable.</small>
+                    </button>
                 </div>
             </div>
 
@@ -772,6 +776,18 @@
                     <button class="secondary" onclick="showTvPairingStep('home')">Back</button>
                 </div>
                 <div id="tv-pairing-manual-results" class="tv-pairing-results"></div>
+            </div>
+
+            <div id="tv-pairing-step-direct" class="tv-pairing-step">
+                <label for="tv-direct-receiver-input" class="setting-label">TV Receiver URL</label>
+                <input id="tv-direct-receiver-input" type="text" placeholder="http://192.168.1.25:41230/api/v1/tv-pairing/config" autocomplete="url" spellcheck="false">
+                <label for="tv-direct-code-input" class="setting-label">TV Code</label>
+                <input id="tv-direct-code-input" type="text" maxlength="6" placeholder="ABC123" autocomplete="one-time-code">
+                <p class="tv-pairing-help">The TV shows this receiver URL beside the QR code. You can also enter just the TV IP or hostname.</p>
+                <div class="tv-pairing-actions">
+                    <button onclick="resolveTvByReceiverUrl()">Find TV</button>
+                    <button class="secondary" onclick="showTvPairingStep('home')">Back</button>
+                </div>
             </div>
 
             <div id="tv-pairing-step-confirm" class="tv-pairing-step">
