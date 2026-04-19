@@ -35,7 +35,6 @@ const DEFAULT_PREFERENCES = {
   pref_voice_assistant_verbosity: "balanced",
   pref_voice_assistant_spoiler_policy: "cautious",
   pref_voice_assistant_spoken_replies: "true",
-  pref_voice_assistant_voice: "male",
   pref_voice_assistant_cloud_api_key: null,
   pref_voice_assistant_gemma_enabled: "false",
 
