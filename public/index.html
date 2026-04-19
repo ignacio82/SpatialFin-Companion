@@ -875,11 +875,13 @@
             </div>
 
             <div id="tv-pairing-step-direct" class="tv-pairing-step">
-                <label for="tv-direct-receiver-input" class="setting-label">TV Receiver URL</label>
-                <input id="tv-direct-receiver-input" type="text" placeholder="http://192.168.1.25:41230/api/v1/tv-pairing/config" autocomplete="url" spellcheck="false">
+                <label for="tv-direct-ip-input" class="setting-label">TV IP address or hostname</label>
+                <input id="tv-direct-ip-input" type="text" placeholder="192.168.1.25" autocomplete="off" spellcheck="false">
+                <label for="tv-direct-port-input" class="setting-label">Port</label>
+                <input id="tv-direct-port-input" type="number" inputmode="numeric" min="1" max="65535" value="41230">
                 <label for="tv-direct-code-input" class="setting-label">TV Code</label>
                 <input id="tv-direct-code-input" type="text" maxlength="6" placeholder="ABC123" autocomplete="one-time-code">
-                <p class="tv-pairing-help">The TV shows this receiver URL beside the QR code. You can also enter just the TV IP or hostname.</p>
+                <p id="tv-direct-hint" class="tv-pairing-help">Look at the TV for the IP shown under the QR code. Port defaults to 41230.</p>
                 <div class="tv-pairing-actions">
                     <button onclick="resolveTvByReceiverUrl()">Find TV</button>
                     <button class="secondary" onclick="showTvPairingStep('home')">Back</button>

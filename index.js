@@ -34,6 +34,7 @@ const { parseSmbClientListing } = require('./share-test-utils');
 const { queryNfsExportsViaRpc } = require('./nfs-rpc');
 const {
   buildPrivateIpv4DiscoveryTargets,
+  collectPrivateIpv4SeedAddresses,
   describePrivateIpv4Subnets,
   extractHostFromAuthority,
   parseSmbClientShareList,
@@ -1278,10 +1279,43 @@ async function mapWithConcurrency(items, concurrency, worker) {
   return results;
 }
 
+/**
+ * Map concurrently and stop firing NEW workers once `done(result)` returns true
+ * for any completed worker. In-flight workers still finish (so we don't leak
+ * AbortControllers), but we cap the total time closer to the first-match
+ * latency instead of the worst-case full sweep.
+ */
+async function mapWithConcurrencyUntil(items, concurrency, worker, done) {
+  const list = Array.isArray(items) ? items : [];
+  const size = Math.max(1, Math.min(concurrency || 1, list.length || 1));
+  const results = new Array(list.length);
+  let nextIndex = 0;
+  let stop = false;
+
+  async function runWorker() {
+    while (!stop) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= list.length) return;
+      const result = await worker(list[index], index);
+      results[index] = result;
+      if (done && done(result)) stop = true;
+    }
+  }
+
+  await Promise.all(Array.from({ length: size }, runWorker));
+  return results;
+}
+
 async function resolveTvDiscoveryPlan(req) {
   const seedAddress = await resolveDiscoverySeedAddress(req);
   const extraHosts = seedAddress ? [seedAddress] : [];
-  const networkInterfaces = seedAddress ? {} : os.networkInterfaces();
+  // Always include os.networkInterfaces() alongside the request-derived seed.
+  // If the request comes in via a reverse-proxy, WireGuard tunnel, or Docker
+  // bridge, the seed can land on a subnet that doesn't actually contain the
+  // TV. Merging host interfaces guarantees we still sweep every LAN the
+  // companion is on — dedup happens inside buildPrivateIpv4DiscoveryTargets.
+  const networkInterfaces = os.networkInterfaces();
   const ips = buildPrivateIpv4DiscoveryTargets(networkInterfaces, extraHosts);
 
   return {
@@ -1332,7 +1366,14 @@ async function discoverTvCandidates(req, manualCode) {
     codePrefix: normalizedCode.slice(0, 3),
     scannedSubnets: discoveryPlan.scannedSubnets
   });
-  const scanned = await mapWithConcurrency(discoveryPlan.targets, TV_PAIRING_DISCOVERY_CONCURRENCY, fetchTvPairingCandidate);
+  // Stop firing new sweep requests as soon as any responder's manual_code
+  // matches — no point scanning the other 200+ IPs once we've found the TV.
+  const scanned = await mapWithConcurrencyUntil(
+    discoveryPlan.targets,
+    TV_PAIRING_DISCOVERY_CONCURRENCY,
+    fetchTvPairingCandidate,
+    (result) => result && result.manual_code === normalizedCode
+  );
   const candidates = scanned.filter(Boolean).filter((entry) => entry.manual_code === normalizedCode);
   const now = Date.now();
   const activeCandidates = candidates.filter((entry) => Number(entry.expires_at_epoch_ms) > now);
@@ -1743,6 +1784,33 @@ adminRouter.get('/qr', async (req, res) => {
     res.json({ qr: qrImage, payload });
   } catch (err) {
     res.status(500).json({ error: 'QR fail' });
+  }
+});
+
+adminRouter.get('/tv-pairing/subnet-hint', async (req, res) => {
+  // Return the first private /24 the companion sees so the UI can prefill
+  // an IP like "192.168.1.X" for the direct-entry flow.
+  try {
+    const seedAddress = await resolveDiscoverySeedAddress(req);
+    const networkInterfaces = os.networkInterfaces();
+    const seeds = collectPrivateIpv4SeedAddresses(
+      networkInterfaces,
+      seedAddress ? [seedAddress] : []
+    );
+    const primary = seeds[0] || '';
+    const parts = primary.split('.');
+    const prefix = parts.length === 4 ? `${parts[0]}.${parts[1]}.${parts[2]}.` : '';
+    res.json({
+      primary,
+      prefix,
+      port: TV_PAIRING_PORT,
+      subnets: describePrivateIpv4Subnets(
+        networkInterfaces,
+        seedAddress ? [seedAddress] : []
+      )
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'subnet_hint_failed', message: error.message });
   }
 });
 

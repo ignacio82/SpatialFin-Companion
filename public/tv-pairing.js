@@ -263,6 +263,33 @@
         }).join('');
     }
 
+    async function prefillDirectFormFromSubnetHint() {
+        var ipInput = el('tv-direct-ip-input');
+        var portInput = el('tv-direct-port-input');
+        var hint = el('tv-direct-hint');
+        if (!ipInput && !portInput) return;
+        try {
+            var res = await fetch('/api/admin/tv-pairing/subnet-hint');
+            if (!res.ok) return;
+            var data = await res.json();
+            if (ipInput && !ipInput.value && data && data.prefix) {
+                // Prefill with the companion's own /24 so the user only types
+                // the TV's last octet. We don't auto-commit — just show a hint
+                // and let them complete the address.
+                ipInput.placeholder = data.prefix + 'X';
+            }
+            if (portInput && data && data.port && !portInput.value) {
+                portInput.value = String(data.port);
+            }
+            if (hint && data && Array.isArray(data.subnets) && data.subnets.length) {
+                hint.textContent = 'Companion is on ' + data.subnets.join(', ') +
+                    '. The TV is usually on the same /24 — look under the QR for the address.';
+            }
+        } catch (_) {
+            // Silently fall back to the static placeholder.
+        }
+    }
+
     window.openTvPairingModal = function(initialStep) {
         clearTvPairingError();
         el('tv-pairing-modal').style.display = 'flex';
@@ -271,6 +298,7 @@
         state.selectedCandidate = null;
         state.mode = null;
         state.sourceStep = 'home';
+        prefillDirectFormFromSubnetHint();
         showTvPairingStep(initialStep || 'home');
     };
 
@@ -401,19 +429,42 @@
         clearTvPairingError();
         state.selectedCandidate = null;
 
-        var receiverInput = el('tv-direct-receiver-input');
+        var ipInput = el('tv-direct-ip-input');
+        var portInput = el('tv-direct-port-input');
         var codeInput = el('tv-direct-code-input');
-        var receiverUrl = receiverInput && receiverInput.value ? receiverInput.value.trim() : '';
+        var rawIp = ipInput && ipInput.value ? ipInput.value.trim() : '';
+        var rawPort = portInput && portInput.value ? String(portInput.value).trim() : '41230';
         var manualCode = normalizeManualCode(codeInput && codeInput.value);
         if (codeInput) codeInput.value = manualCode;
 
-        if (!receiverUrl) {
-            setTvPairingError('Enter the TV receiver URL shown on the TV.');
+        if (!rawIp) {
+            setTvPairingError('Enter the TV IP address or hostname shown on the TV.');
+            return;
+        }
+        var portNum = parseInt(rawPort, 10);
+        if (!Number.isFinite(portNum) || portNum < 1 || portNum > 65535) {
+            setTvPairingError('Enter a valid port (1-65535).');
             return;
         }
         if (manualCode.length !== 6) {
             setTvPairingError('Enter the full 6-character TV code.');
             return;
+        }
+
+        // Compose the receiver URL the server expects. Accepts either an IP,
+        // "host:port", or a full URL in the IP field — the server normalizes.
+        var receiverUrl;
+        if (/^[a-z][a-z0-9+.-]*:\/\//i.test(rawIp)) {
+            receiverUrl = rawIp;
+        } else {
+            var host = rawIp;
+            // If the user already included :port in the IP field, strip it so
+            // the explicit port field wins.
+            var portIdx = host.lastIndexOf(':');
+            if (portIdx > 0 && !host.includes('/')) {
+                host = host.slice(0, portIdx);
+            }
+            receiverUrl = 'http://' + host + ':' + portNum + '/api/v1/tv-pairing/config';
         }
 
         try {
