@@ -6,6 +6,8 @@
     <title>SpatialFin Companion</title>
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#00a4dc">
+    <link rel="icon" type="image/png" sizes="192x192" href="icon.png">
+    <link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
     <link rel="apple-touch-icon" href="icon.png">
     <link rel="stylesheet" href="style.css">
 
@@ -16,14 +18,18 @@
 </head>
 <body>
     <!-- Login overlay -->
-    <div id="login-overlay" class="login-overlay" style="display:none">
-        <div class="login-box">
-            <div class="login-icon">&#128274;</div>
-            <h2>Admin Login</h2>
-            <input type="password" id="login-password" placeholder="Enter admin password" onkeydown="if(event.key==='Enter')doLogin()">
-            <button onclick="doLogin()">Login</button>
-            <p id="login-error" style="color:var(--error);font-size:0.85rem;margin-top:10px;display:none;"></p>
-        </div>
+    <div id="login-overlay" class="login-overlay" role="dialog" aria-modal="true" aria-labelledby="login-heading" style="display:none">
+        <form class="login-box" onsubmit="event.preventDefault(); doLogin();" autocomplete="on">
+            <div class="login-icon" aria-hidden="true">&#128274;</div>
+            <h2 id="login-heading">Admin Login</h2>
+            <label for="login-password" class="sr-only">Admin password</label>
+            <input type="password" id="login-password" name="password" placeholder="Enter admin password" autocomplete="current-password" required>
+            <label class="login-remember">
+                <input type="checkbox" id="login-remember"> Keep me signed in for 30 days
+            </label>
+            <button type="submit">Login</button>
+            <p id="login-error" role="alert" style="color:var(--error);font-size:0.85rem;margin-top:10px;display:none;"></p>
+        </form>
     </div>
 
     <!-- QR fullscreen overlay -->
@@ -33,11 +39,14 @@
     </div>
 
     <!-- Toast container -->
-    <div id="toast-container" class="toast-container"></div>
+    <div id="toast-container" class="toast-container" role="status" aria-live="polite" aria-atomic="false"></div>
 
     
     <!-- Mobile Header -->
     <div class="mobile-header" id="mobile-header">
+        <button class="hamburger" id="hamburger" type="button" aria-label="Open navigation menu" aria-expanded="false" aria-controls="main-nav" onclick="toggleSidebar()">
+            <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none" aria-hidden="true" focusable="false"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+        </button>
         <h1>SPATIALFIN</h1>
         <button id="install-button" class="install-btn" style="display: none;">Install</button>
     </div>
@@ -45,24 +54,23 @@
     <!-- Sidebar Overlay -->
     <div id="sidebar-overlay" class="sidebar-overlay" onclick="toggleSidebar()"></div>
 
-    <!-- Hamburger for tablet/mobile -->
-    <button class="hamburger" id="hamburger" onclick="toggleSidebar()">
-        <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
-    </button>
-
-    <nav id="main-nav">
+    <nav id="main-nav" aria-label="Primary">
         <div class="logo-container">
             <img src="icon.png" alt="SpatialFin Logo">
             <h1>SPATIALFIN</h1>
         </div>
-        <div class="nav-link" data-section="dashboard" onclick="showSection('dashboard', this)">Dashboard</div>
-        <div class="nav-link" data-section="analytics" onclick="showSection('analytics', this)">Analytics</div>
-        <div class="nav-link" data-section="global-settings" onclick="showSection('global-settings', this)">Global Settings</div>
-        <div class="nav-link" data-section="external-services" onclick="showSection('external-services', this)">External Services</div>
-        <div class="nav-link" data-section="device-logs" onclick="showSection('device-logs', this)">Device Logs</div>
-        <div class="nav-link" data-section="servers" onclick="showSection('servers', this)">Servers &amp; Users</div>
-        <div class="nav-link" data-section="network-shares" onclick="showSection('network-shares', this)">Network Shares</div>
+        <div class="nav-link" data-section="dashboard" onclick="showSection('dashboard', this)"><span style="margin-right:12px;opacity:0.7;">&#128202;</span> Dashboard</div>
+        <div class="nav-link" data-section="analytics" onclick="showSection('analytics', this)"><span style="margin-right:12px;opacity:0.7;">&#128200;</span> Analytics</div>
+        <div class="nav-link" data-section="global-settings" onclick="showSection('global-settings', this)"><span style="margin-right:12px;opacity:0.7;">&#9881;</span> Global Settings</div>
+        <div class="nav-link" data-section="external-services" onclick="showSection('external-services', this)"><span style="margin-right:12px;opacity:0.7;">&#127760;</span> External Services</div>
+        <div class="nav-link" data-section="device-logs" onclick="showSection('device-logs', this)"><span style="margin-right:12px;opacity:0.7;">&#128221;</span> Device Logs</div>
+        <div class="nav-link" data-section="servers" onclick="showSection('servers', this)"><span style="margin-right:12px;opacity:0.7;">&#128421;</span> Servers &amp; Users</div>
+        <div class="nav-link" data-section="network-shares" onclick="showSection('network-shares', this)"><span style="margin-right:12px;opacity:0.7;">&#128193;</span> Network Shares</div>
         <div style="flex-grow: 1;"></div>
+        <div class="nav-footer">
+            <button id="logout-button" type="button" class="secondary logout-btn" onclick="doLogout()" style="display:none;">Sign out</button>
+            <div class="nav-version" id="nav-version" aria-label="App version"></div>
+        </div>
     </nav>
 
     <main>
@@ -79,14 +87,14 @@
             <!-- QR Card -->
             <div class="card" style="text-align: center;">
                 <h3>Device Discovery</h3>
-                <p>Scan this QR code with your Galaxy XR device during setup.</p>
+                <p>Scan this QR code with the SpatialFin app on your XR headset or TV during setup.</p>
                 <div id="qr-display">
                     <img id="qr-image" alt="QR Code" style="max-width:260px;">
                 </div>
                 <div style="margin-top: 15px;">
                     <button class="secondary" onclick="showQRFullscreen()">Fullscreen</button>
                 </div>
-                <p style="margin-top: 20px; font-family: monospace; font-size: 0.8rem; color: var(--text-muted);" id="qr-payload-text"></p>
+                <p style="margin-top: 20px; font-family: monospace; font-size: 0.8rem; color: var(--text-muted); word-break: break-all; overflow-wrap: anywhere;" id="qr-payload-text"></p>
             </div>
 
             <div class="card">
@@ -354,7 +362,7 @@
                 </div>
             </div>
 
-            <div style="display:grid;grid-template-columns:minmax(280px, 360px) minmax(0, 1fr);gap:20px;align-items:start;">
+            <div class="device-logs-grid">
                 <div class="card">
                     <h3>Devices</h3>
                     <div id="log-device-list" class="log-device-list">
@@ -367,8 +375,11 @@
                             <h3 id="log-viewer-title">Select a device</h3>
                             <div class="log-meta" id="log-viewer-meta">No device selected.</div>
                         </div>
-                        <button class="danger" id="clear-logs-button" onclick="clearSelectedLogs()" disabled>Clear Logs</button>
-   <button class="secondary" id="download-logs-button" onclick="downloadSelectedLogs()" disabled>Download Logs</button>
+                        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                            <button class="secondary" id="copy-logs-button" onclick="copySelectedLogs()" disabled>Copy Logs</button>
+                            <button class="secondary" id="download-logs-button" onclick="downloadSelectedLogs()" disabled>Download Logs</button>
+                            <button class="danger" id="clear-logs-button" onclick="clearSelectedLogs()" disabled>Clear Logs</button>
+                        </div>
                     </div>
                     <div style="display:flex;gap:10px;margin-top:16px;align-items:center;flex-wrap:wrap;">
      <input type="text" id="log-search" placeholder="Search logs..." oninput="filterLogs()" style="flex:1;min-width:150px;">

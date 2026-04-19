@@ -53,6 +53,27 @@ let autoScrollEnabled = true;
             };
         }
 
+        // ── Fetch wrapper: show login overlay on 401 for admin routes ──
+        (function wrapFetchFor401() {
+            if (typeof window === 'undefined' || !window.fetch) return;
+            const nativeFetch = window.fetch.bind(window);
+            window.fetch = async function(input, init) {
+                const url = typeof input === 'string' ? input : (input && input.url) || '';
+                const isAdmin = url.indexOf('/api/admin/') === 0;
+                const response = await nativeFetch(input, init);
+                if (response.status === 401 && isAdmin
+                    && !/\/api\/admin\/(login|auth-check|logout)/.test(url)) {
+                    var overlay = document.getElementById('login-overlay');
+                    if (overlay && overlay.style.display !== 'flex') {
+                        overlay.style.display = 'flex';
+                        var pw = document.getElementById('login-password');
+                        if (pw) { pw.value = ''; pw.focus(); }
+                    }
+                }
+                return response;
+            };
+        })();
+
         // ── Toast system ──
         function showToast(message, type) {
             type = type || 'info';
@@ -180,7 +201,24 @@ let autoScrollEnabled = true;
                 var name = ALL_LANGS[code] || code.toUpperCase();
                 var chip = document.createElement('div');
                 chip.className = "lang-chip";
-                chip.innerHTML = '<span>' + name + '</span> <span class="remove" onclick="removeSpokenLanguage(\'' + code + '\')">&#215;</span>';
+                var label = document.createElement('span');
+                label.textContent = name;
+                var removeBtn = document.createElement('span');
+                removeBtn.className = 'remove';
+                removeBtn.setAttribute('role', 'button');
+                removeBtn.setAttribute('tabindex', '0');
+                removeBtn.setAttribute('aria-label', 'Remove ' + name);
+                removeBtn.textContent = '\u00D7';
+                removeBtn.addEventListener('click', function() { removeSpokenLanguage(code); });
+                removeBtn.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        removeSpokenLanguage(code);
+                    }
+                });
+                chip.appendChild(label);
+                chip.appendChild(document.createTextNode(' '));
+                chip.appendChild(removeBtn);
                 list.appendChild(chip);
             });
             document.getElementById('pref_smart_spoken_languages').value = spokenLanguages.join(',');
@@ -237,17 +275,19 @@ let autoScrollEnabled = true;
                     currentActive.classList.remove('active', 'fade-out');
                     var target = document.getElementById(id);
                     target.classList.add('active');
-                }, 150);
+                }, 250);
             } else if (!currentActive || currentActive.id === id) {
                 document.querySelectorAll('.section').forEach(function(s) { s.classList.remove('active', 'fade-out'); });
                 document.getElementById(id).classList.add('active');
             }
-            document.querySelectorAll('.nav-link').forEach(function(l) { l.classList.remove('active'); });
-            if (navEl) {
-                navEl.classList.add('active');
-            } else {
-                var link = document.querySelector('.nav-link[data-section="' + id + '"]');
-                if (link) link.classList.add('active');
+            document.querySelectorAll('.nav-link').forEach(function(l) {
+                l.classList.remove('active');
+                l.removeAttribute('aria-current');
+            });
+            var activeLink = navEl || document.querySelector('.nav-link[data-section="' + id + '"]');
+            if (activeLink) {
+                activeLink.classList.add('active');
+                activeLink.setAttribute('aria-current', 'page');
             }
             // Close sidebar on tablet after navigating
             var nav = document.getElementById('main-nav');
@@ -266,6 +306,10 @@ let autoScrollEnabled = true;
             nav.classList.toggle('open');
             var overlay = document.getElementById('sidebar-overlay');
             if (overlay) overlay.classList.toggle('open');
+            var hamburger = document.getElementById('hamburger');
+            if (hamburger) {
+                hamburger.setAttribute('aria-expanded', nav.classList.contains('open') ? 'true' : 'false');
+            }
         }
 
         // ── QR ──
@@ -290,6 +334,31 @@ let autoScrollEnabled = true;
         function closeQRFullscreen() {
             document.getElementById('qr-fullscreen').style.display = 'none';
         }
+
+        document.addEventListener('keydown', function(e) {
+            if (e.key !== 'Escape') return;
+            var qr = document.getElementById('qr-fullscreen');
+            if (qr && qr.style.display === 'flex') {
+                closeQRFullscreen();
+                e.preventDefault();
+                return;
+            }
+            var tvModal = document.getElementById('tv-pairing-modal');
+            if (tvModal && tvModal.style.display === 'flex' && typeof window.closeTvPairingModal === 'function') {
+                window.closeTvPairingModal();
+                e.preventDefault();
+                return;
+            }
+            var nav = document.getElementById('main-nav');
+            if (nav && nav.classList.contains('open')) {
+                nav.classList.remove('open');
+                var overlay = document.getElementById('sidebar-overlay');
+                if (overlay) overlay.classList.remove('open');
+                var hamburger = document.getElementById('hamburger');
+                if (hamburger) hamburger.setAttribute('aria-expanded', 'false');
+                e.preventDefault();
+            }
+        });
 
         // ── Token management ──
         function toggleTokenVisibility() {
@@ -542,7 +611,7 @@ let autoScrollEnabled = true;
                         var time = entry.timestamp ? new Date(entry.timestamp).toLocaleString() : '-';
                         var agent = entry.userAgent || '-';
                         var ip = entry.ip || '-';
-                        tr.innerHTML = '<td>' + time + '</td><td>' + agent + '</td><td>' + ip + '</td>';
+                        tr.innerHTML = '<td>' + escapeHtml(time) + '</td><td>' + escapeHtml(agent) + '</td><td>' + escapeHtml(ip) + '</td>';
                         tbody.appendChild(tr);
                     });
                 } else {
@@ -841,6 +910,13 @@ let autoScrollEnabled = true;
             var sessionBars = [];
             var labels = [];
 
+            // Show at most ~10 x-axis labels so they don't overlap when the
+            // range is large (e.g. 90/180/365 days).
+            var maxLabels = 10;
+            var labelStride = Math.max(1, Math.ceil(trends.length / maxLabels));
+            // Bars get narrower as the range grows so they don't visually merge.
+            var barHalfWidth = Math.min(10, Math.max(1.5, (stepX || innerWidth) * 0.32));
+
             trends.forEach(function(day, index) {
                 var x = paddingLeft + (trends.length > 1 ? stepX * index : innerWidth / 2);
                 var durationValue = Number(day.totalPlayDurationMs) || 0;
@@ -849,13 +925,18 @@ let autoScrollEnabled = true;
                 var barHeight = Math.max(4, Math.round((sessionValue / maxSessions) * innerHeight * 0.38));
                 durationPoints.push(x.toFixed(2) + ',' + y.toFixed(2));
                 sessionBars.push(
-                    '<rect x="' + (x - 10).toFixed(2) + '" y="' + (paddingTop + innerHeight - barHeight).toFixed(2) + '" width="20" height="' + barHeight.toFixed(2) + '" rx="6" class="analytics-chart-bar">' +
+                    '<rect x="' + (x - barHalfWidth).toFixed(2) + '" y="' + (paddingTop + innerHeight - barHeight).toFixed(2) + '" width="' + (barHalfWidth * 2).toFixed(2) + '" height="' + barHeight.toFixed(2) + '" rx="' + Math.min(6, barHalfWidth).toFixed(2) + '" class="analytics-chart-bar">' +
                         '<title>' + svgEscape(day.day + ': ' + formatDurationMs(durationValue) + ', ' + sessionValue + ' sessions') + '</title>' +
                     '</rect>'
                 );
-                labels.push(
-                    '<text x="' + x.toFixed(2) + '" y="' + (height - 16) + '" text-anchor="middle" class="analytics-chart-label">' + svgEscape(day.day.slice(5)) + '</text>'
-                );
+                var showLabel = (index === 0)
+                    || (index === trends.length - 1)
+                    || (index % labelStride === 0);
+                if (showLabel) {
+                    labels.push(
+                        '<text x="' + x.toFixed(2) + '" y="' + (height - 16) + '" text-anchor="middle" class="analytics-chart-label">' + svgEscape(day.day.slice(5)) + '</text>'
+                    );
+                }
             });
 
             var areaPoints = durationPoints.slice();
@@ -885,7 +966,8 @@ let autoScrollEnabled = true;
                         durationPoints.map(function(point, index) {
                             var coords = point.split(',');
                             var label = trends[index].day + ': ' + formatDurationMs(trends[index].totalPlayDurationMs) + ', ' + trends[index].sessionCount + ' sessions';
-                            return '<circle cx="' + coords[0] + '" cy="' + coords[1] + '" r="4.5" class="analytics-chart-point"><title>' + svgEscape(label) + '</title></circle>';
+                            var pointRadius = trends.length > 60 ? 2.2 : (trends.length > 30 ? 3 : 4.5);
+                            return '<circle cx="' + coords[0] + '" cy="' + coords[1] + '" r="' + pointRadius + '" class="analytics-chart-point"><title>' + svgEscape(label) + '</title></circle>';
                         }).join('') +
                         labels.join('') +
                     '</svg>' +
@@ -1222,14 +1304,16 @@ let autoScrollEnabled = true;
                 document.getElementById('log-viewer-title').textContent = device.deviceName || device.deviceId || 'Device Logs';
                 document.getElementById('log-viewer-meta').textContent = meta.join(' • ');
                 document.getElementById('download-logs-button').disabled = false;
+                document.getElementById('copy-logs-button').disabled = false;
                 currentDeviceLogs = entries;
-   document.getElementById('clear-logs-button').disabled = false;
-   renderLogs();
+                document.getElementById('clear-logs-button').disabled = false;
+                renderLogs();
             } catch (e) {
                 document.getElementById('log-viewer-title').textContent = 'Device Logs';
                 document.getElementById('log-viewer-meta').textContent = 'Could not load the selected device.';
                 document.getElementById('log-viewer').textContent = 'Could not load device logs.';
                 document.getElementById('download-logs-button').disabled = true;
+                document.getElementById('copy-logs-button').disabled = true;
             }
         }
 
@@ -1237,6 +1321,60 @@ let autoScrollEnabled = true;
             if (!selectedLogDeviceId) return;
             window.location.href = '/api/admin/device-logs/' + encodeURIComponent(selectedLogDeviceId) + '/download';
         }
+
+        function buildLogsTextForCopy() {
+            var search = (document.getElementById('log-search').value || '').toLowerCase();
+            var filter = document.getElementById('log-level-filter').value;
+            var lines = [];
+            currentDeviceLogs.forEach(function(entry) {
+                var level = (entry.level || '?').toUpperCase();
+                if (filter !== 'ALL' && !level.includes(filter) && filter !== level) return;
+                var line = (entry.timestamp || entry.receivedAt || '') + ' ' + level + '/' + (entry.tag || 'SpatialFin') + ': ' + (entry.message || '') + (entry.stack ? '\n' + entry.stack : '');
+                if (search && line.toLowerCase().indexOf(search) === -1) return;
+                lines.push(line);
+            });
+            return lines.join('\n');
+        }
+
+        async function copySelectedLogs() {
+            if (!selectedLogDeviceId || !currentDeviceLogs.length) {
+                showToast('No logs to copy', 'error');
+                return;
+            }
+            var text = buildLogsTextForCopy();
+            if (!text) {
+                showToast('No log lines match the current filters', 'error');
+                return;
+            }
+            var btn = document.getElementById('copy-logs-button');
+            var originalLabel = btn ? btn.textContent : '';
+            try {
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(text);
+                } else {
+                    // Fallback for plain HTTP / older browsers.
+                    var ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.setAttribute('readonly', '');
+                    ta.style.position = 'fixed';
+                    ta.style.opacity = '0';
+                    document.body.appendChild(ta);
+                    ta.select();
+                    var ok = document.execCommand('copy');
+                    document.body.removeChild(ta);
+                    if (!ok) throw new Error('execCommand copy failed');
+                }
+                var lineCount = text.split('\n').length;
+                showToast('Copied ' + lineCount + ' log line' + (lineCount === 1 ? '' : 's'), 'success');
+                if (btn) {
+                    btn.textContent = 'Copied!';
+                    setTimeout(function() { btn.textContent = originalLabel || 'Copy Logs'; }, 1500);
+                }
+            } catch (err) {
+                showToast('Could not copy logs: ' + (err.message || 'unknown error'), 'error');
+            }
+        }
+        window.copySelectedLogs = copySelectedLogs;
 
         // ── Render servers ──
         function renderServers() {
@@ -1617,7 +1755,7 @@ let autoScrollEnabled = true;
                     '<button class="danger" onclick="removeShare(' + idx + ')">Remove</button>' +
                     '</div>' +
                     '</div>' +
-                    '<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">' +
+                    '<div class="share-field-grid">' +
                     '<div>' +
                     '<label class="setting-label">Protocol</label>' +
                     '<select onchange="configData.networkShares[' + idx + '].protocol=this.value;renderShares();markDirty(\'network-shares\')" style="width: 100%;">' +
@@ -1748,17 +1886,23 @@ let autoScrollEnabled = true;
         // ── Admin auth flow ──
         async function doLogin() {
             var password = document.getElementById('login-password').value;
+            var rememberEl = document.getElementById('login-remember');
+            var remember = !!(rememberEl && rememberEl.checked);
             var errorEl = document.getElementById('login-error');
             errorEl.style.display = 'none';
             try {
                 var res = await fetch('/api/admin/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password: password })
+                    body: JSON.stringify({ password: password, remember: remember })
                 });
                 if (res.ok) {
                     document.getElementById('login-overlay').style.display = 'none';
+                    document.getElementById('login-password').value = '';
                     await loadConfig();
+                } else if (res.status === 429) {
+                    errorEl.textContent = 'Too many attempts. Try again in a few minutes.';
+                    errorEl.style.display = 'block';
                 } else {
                     errorEl.textContent = 'Invalid password';
                     errorEl.style.display = 'block';
@@ -1768,6 +1912,14 @@ let autoScrollEnabled = true;
                 errorEl.style.display = 'block';
             }
         }
+
+        async function doLogout() {
+            try {
+                await fetch('/api/admin/logout', { method: 'POST' });
+            } catch (_) {}
+            window.location.reload();
+        }
+        window.doLogout = doLogout;
 
         async function loadConfig() {
             var res = await fetch('/api/admin/config');
@@ -1819,15 +1971,30 @@ let autoScrollEnabled = true;
             });
         }
 
+        async function loadAppMeta() {
+            try {
+                var res = await fetch('/api/meta');
+                if (!res.ok) return;
+                var data = await res.json();
+                var el = document.getElementById('nav-version');
+                if (el && data.version) el.textContent = 'v' + data.version;
+            } catch (_) {}
+        }
+
         async function init() {
+            loadAppMeta();
             // Check auth
             try {
                 var authRes = await fetch('/api/admin/auth-check');
                 var authData = await authRes.json();
+                var logoutBtn = document.getElementById('logout-button');
                 if (authData.authRequired && !authData.authenticated) {
                     document.getElementById('login-overlay').style.display = 'flex';
                     document.getElementById('login-password').focus();
                     return;
+                }
+                if (logoutBtn && authData.authRequired) {
+                    logoutBtn.style.display = 'block';
                 }
             } catch (e) {
                 // Auth check not available, proceed
