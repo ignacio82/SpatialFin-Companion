@@ -693,6 +693,23 @@ img, svg, video, canvas {
             box-shadow: 0 4px 12px var(--primary-glow);
         }
 
+        .log-device-item-wrapper {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .log-device-item-wrapper .log-device-item {
+            width: 100%;
+        }
+
+        .log-device-actions {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+            flex-wrap: wrap;
+        }
+
         .log-viewer {
             min-height: 420px;
             max-height: 70vh;

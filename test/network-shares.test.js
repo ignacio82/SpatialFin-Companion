@@ -125,3 +125,9 @@ test('isPathWithinExport matches exact and nested exports', () => {
   assert.equal(isPathWithinExport('/srv/media/movies', '/srv/media'), true);
   assert.equal(isPathWithinExport('/srv/other', '/srv/media'), false);
 });
+
+test('isPathWithinExport rejects traversal segments', () => {
+  assert.equal(isPathWithinExport('/srv/media/../etc', '/srv/media'), false);
+  assert.equal(isPathWithinExport('/srv/..', '/srv'), false);
+  assert.equal(isPathWithinExport('/srv/media/../../secret', '/srv/media'), false);
+});

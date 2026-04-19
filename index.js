@@ -55,8 +55,50 @@ const PORT = Number(process.env.PORT) || 1982;
 const ANALYTICS_SYNC_INTERVAL_MS = Math.max(30_000, Number(process.env.ANALYTICS_SYNC_INTERVAL_MS) || 120_000);
 const execFileAsync = promisify(execFile);
 
-app.use(helmet({ contentSecurityPolicy: false })); // Disabled CSP for inline scripts if any
-app.use(cors());
+// CSP permits inline handlers (UI still uses onclick="" everywhere) but
+// blocks external scripts/objects and frames. Tightening further requires
+// migrating every onclick= to addEventListener so 'unsafe-inline' +
+// script-src-attr can be dropped.
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: true,
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrcAttr: ["'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", 'data:', 'blob:'],
+      connectSrc: ["'self'", 'ws:', 'wss:'],
+      mediaSrc: ["'self'", 'blob:'],
+      fontSrc: ["'self'", 'data:'],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'self'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"],
+      // Don't force http:// subresources to https:// — companion runs over
+      // plain HTTP on the LAN by default.
+      upgradeInsecureRequests: null
+    }
+  },
+  crossOriginEmbedderPolicy: false,
+  // HSTS makes no sense for plain-HTTP LAN deployment; opt-in via reverse proxy if needed.
+  strictTransportSecurity: false
+}));
+
+const ALLOWED_CORS_ORIGINS = (process.env.COMPANION_CORS_ORIGINS || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+app.use(cors({
+  origin: (origin, cb) => {
+    // Same-origin (no Origin header) and admin UI requests.
+    if (!origin) return cb(null, true);
+    if (ALLOWED_CORS_ORIGINS.length === 0) return cb(null, false);
+    if (ALLOWED_CORS_ORIGINS.includes('*')) return cb(null, true);
+    return cb(null, ALLOWED_CORS_ORIGINS.includes(origin));
+  },
+  credentials: true
+}));
 app.use(bodyParser.json({ limit: '5mb' }));
 app.use(express.static('public'));
 
@@ -83,12 +125,18 @@ const analyticsSyncState = {
   websocketLastMessageAt: null
 };
 const jellyfinRealtimeSockets = new Map();
-const TV_PAIRING_DISCOVERY_TIMEOUT_MS = 1200;
-const TV_PAIRING_POST_TIMEOUT_MS = 5000;
-const TV_PAIRING_DISCOVERY_CONCURRENCY = 24;
-const NETWORK_SHARE_DISCOVERY_CONNECT_TIMEOUT_MS = 700;
-const NETWORK_SHARE_DISCOVERY_CONCURRENCY = 48;
-const NETWORK_SHARE_DISCOVERY_SMB_LIST_TIMEOUT_MS = 12000;
+function envInt(name, defaultValue, min, max) {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw)) return defaultValue;
+  const clamped = Math.max(min, Math.min(max, Math.floor(raw)));
+  return clamped;
+}
+const TV_PAIRING_DISCOVERY_TIMEOUT_MS = envInt('COMPANION_TV_DISCOVERY_TIMEOUT_MS', 1200, 200, 30_000);
+const TV_PAIRING_POST_TIMEOUT_MS = envInt('COMPANION_TV_POST_TIMEOUT_MS', 5000, 500, 60_000);
+const TV_PAIRING_DISCOVERY_CONCURRENCY = envInt('COMPANION_TV_DISCOVERY_CONCURRENCY', 24, 1, 128);
+const NETWORK_SHARE_DISCOVERY_CONNECT_TIMEOUT_MS = envInt('COMPANION_SHARE_CONNECT_TIMEOUT_MS', 700, 100, 30_000);
+const NETWORK_SHARE_DISCOVERY_CONCURRENCY = envInt('COMPANION_SHARE_DISCOVERY_CONCURRENCY', 48, 1, 128);
+const NETWORK_SHARE_DISCOVERY_SMB_LIST_TIMEOUT_MS = envInt('COMPANION_SHARE_SMB_LIST_TIMEOUT_MS', 12000, 500, 120_000);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -505,17 +553,9 @@ async function discoverNetworkShareCandidates(req) {
   };
 }
 
-async function testSmbShareConnection(share) {
+async function testSmbShareConnectionViaProbe(share) {
+  const probePath = normalizeShareRelativePath(share.path);
   try {
-    try {
-      return await testSmbShareConnectionWithSmbClient(share);
-    } catch (error) {
-      if (!(error && error.code === 'ENOENT')) {
-        throw error;
-      }
-    }
-
-    const probePath = normalizeShareRelativePath(share.path);
     const { stdout } = await execFileAsync(
       process.execPath,
       ['--openssl-legacy-provider', path.join(__dirname, 'smb-probe.js')],
@@ -562,6 +602,25 @@ async function testSmbShareConnection(share) {
       }
     }
     throw error;
+  }
+}
+
+async function testSmbShareConnection(share) {
+  let smbclientError = null;
+  try {
+    return await testSmbShareConnectionWithSmbClient(share);
+  } catch (error) {
+    smbclientError = error;
+  }
+
+  // Fallback to the bundled probe on any smbclient failure (missing binary or
+  // protocol/auth error). Rethrow the original smbclient error if the probe
+  // also fails so users see the first error they'd actually debug against.
+  try {
+    return await testSmbShareConnectionViaProbe(share);
+  } catch (probeError) {
+    if (smbclientError && smbclientError.code !== 'ENOENT') throw smbclientError;
+    throw probeError;
   }
 }
 
@@ -672,10 +731,47 @@ function findVerifiedUserForServer(serverId, preferredUserId, preferredUsername)
   return { server, user: exact || candidates[0] || null };
 }
 
+const JELLYFIN_METADATA_CACHE_TTL_MS = Math.max(
+  60_000,
+  Number(process.env.COMPANION_ITEM_METADATA_TTL_MS) || 30 * 60_000
+);
+const JELLYFIN_METADATA_CACHE_MAX = 2000;
+const jellyfinItemMetadataCache = new Map(); // key -> { value, expiresAt }
+
+function metadataCacheKey(serverId, itemId) {
+  return `${serverId || 'server'}:${itemId}`;
+}
+
+function getCachedItemMetadata(serverConfig, itemId) {
+  const key = metadataCacheKey(serverConfig && serverConfig.id, itemId);
+  const entry = jellyfinItemMetadataCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    jellyfinItemMetadataCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setCachedItemMetadata(serverConfig, itemId, value) {
+  if (!value) return;
+  const key = metadataCacheKey(serverConfig && serverConfig.id, itemId);
+  if (jellyfinItemMetadataCache.size >= JELLYFIN_METADATA_CACHE_MAX) {
+    const firstKey = jellyfinItemMetadataCache.keys().next().value;
+    if (firstKey) jellyfinItemMetadataCache.delete(firstKey);
+  }
+  jellyfinItemMetadataCache.set(key, {
+    value,
+    expiresAt: Date.now() + JELLYFIN_METADATA_CACHE_TTL_MS
+  });
+}
+
 async function fetchJellyfinItemMetadata(serverConfig, userConfig, itemId) {
   const baseUrl = String((serverConfig.addresses && serverConfig.addresses[0]) || '').replace(/\/+$/, '');
   const token = userConfig && userConfig.access_token;
   if (!baseUrl || !token || !itemId) return null;
+  const cached = getCachedItemMetadata(serverConfig, itemId);
+  if (cached) return cached;
   const encodedItemId = encodeURIComponent(itemId);
   const userId = userConfig.id ? encodeURIComponent(userConfig.id) : null;
   const itemPath = userId ? `/Users/${userId}/Items/${encodedItemId}` : `/Items/${encodedItemId}`;
@@ -684,7 +780,9 @@ async function fetchJellyfinItemMetadata(serverConfig, userConfig, itemId) {
   if (result.status !== 200 || !result.data || typeof result.data !== 'object') {
     throw new Error(`Item fetch failed for ${serverConfig.name || baseUrl}: HTTP ${result.status}`);
   }
-  return normalizeJellyfinItemMetadata(serverConfig, result.data);
+  const metadata = normalizeJellyfinItemMetadata(serverConfig, result.data);
+  setCachedItemMetadata(serverConfig, itemId, metadata);
+  return metadata;
 }
 
 async function enrichSessionsWithItemMetadata(serverConfig, userConfig, sessions) {
@@ -872,6 +970,7 @@ function connectJellyfinRealtimeSocket(serverConfig, userConfig) {
   const existing = jellyfinRealtimeSockets.get(key);
   if (existing && existing.url === url) return;
   if (existing) {
+    existing.aborted = true;
     existing.closedManually = true;
     if (existing.refreshTimer) clearTimeout(existing.refreshTimer);
     if (existing.reconnectTimer) clearTimeout(existing.reconnectTimer);
@@ -889,6 +988,8 @@ function connectJellyfinRealtimeSocket(serverConfig, userConfig) {
     reconnectTimer: null,
     refreshTimer: null,
     closedManually: false,
+    aborted: false,
+    disabled: false,
     messageCount: 0,
     lastMessageAt: null
   };
@@ -896,6 +997,11 @@ function connectJellyfinRealtimeSocket(serverConfig, userConfig) {
   refreshRealtimeSocketSummary();
 
   const open = () => {
+    if (entry.aborted || entry.disabled) return;
+    if (jellyfinRealtimeSockets.get(key) !== entry) {
+      entry.aborted = true;
+      return;
+    }
     const socket = new WebSocket(url, {
       headers: buildJellyfinAuthHeaders(userConfig.access_token)
     });
@@ -911,7 +1017,7 @@ function connectJellyfinRealtimeSocket(serverConfig, userConfig) {
       scheduleSocketScopeRefresh(entry, 'websocket-open');
     });
 
-    socket.on('message', (raw) => {
+    socket.on('message', async (raw) => {
       entry.connected = true;
       entry.messageCount += 1;
       entry.lastMessageAt = new Date().toISOString();
@@ -927,18 +1033,25 @@ function connectJellyfinRealtimeSocket(serverConfig, userConfig) {
       const messageType = payload.MessageType || payload.messageType || payload.Type || payload.type || '';
       const sessions = extractRealtimeSessionsFromMessage(serverConfig, userConfig, payload);
       if (sessions.length > 0) {
-        enrichSessionsWithItemMetadata(serverConfig, userConfig, sessions).catch((error) => {
+        try {
+          await enrichSessionsWithItemMetadata(serverConfig, userConfig, sessions);
+        } catch (error) {
           console.warn('Realtime metadata enrichment failed:', serverConfig.name || serverConfig.id, error.message);
-        });
-        const result = storage.upsertPlaybackSessions({ sessions }, buildAnalyticsRequestContext('companion-analytics-websocket'));
-        analyticsSyncState.accepted = result.accepted || 0;
-        analyticsSyncState.totalSessions = result.totalSessions || analyticsSyncState.totalSessions || 0;
-        analyticsSyncState.lastSuccessAt = new Date().toISOString();
-        broadcastAdminEvent({
-          type: 'analytics_sessions_ingested',
-          accepted: result.accepted || 0,
-          totalSessions: analyticsSyncState.totalSessions
-        });
+        }
+        try {
+          const result = storage.upsertPlaybackSessions({ sessions }, buildAnalyticsRequestContext('companion-analytics-websocket'));
+          analyticsSyncState.accepted = result.accepted || 0;
+          analyticsSyncState.totalSessions = result.totalSessions || analyticsSyncState.totalSessions || 0;
+          analyticsSyncState.lastSuccessAt = new Date().toISOString();
+          broadcastAdminEvent({
+            type: 'analytics_sessions_ingested',
+            accepted: result.accepted || 0,
+            totalSessions: analyticsSyncState.totalSessions
+          });
+        } catch (error) {
+          analyticsSyncState.lastError = error.message;
+          console.warn('Realtime session upsert failed:', serverConfig.name || serverConfig.id, error.message);
+        }
       }
 
       if (looksLikePlaybackMessage(messageType)) {
@@ -946,13 +1059,31 @@ function connectJellyfinRealtimeSocket(serverConfig, userConfig) {
       }
     });
 
+    socket.on('unexpected-response', (_req, response) => {
+      const status = response && response.statusCode;
+      if (status === 401 || status === 403) {
+        entry.disabled = true;
+        entry.lastError = `WebSocket auth failed (HTTP ${status})`;
+        console.warn('Disabling Jellyfin realtime socket:', serverConfig.name || serverConfig.id, entry.lastError);
+        refreshRealtimeSocketSummary();
+      }
+      try { response && response.destroy && response.destroy(); } catch (_) {}
+    });
+
     socket.on('close', () => {
       entry.connected = false;
+      entry.socket = null;
       refreshRealtimeSocketSummary();
-      if (entry.closedManually) return;
+      if (entry.closedManually || entry.aborted || entry.disabled) return;
+      if (jellyfinRealtimeSockets.get(key) !== entry) return;
       const retryDelay = Math.min(60_000, 2000 * Math.max(1, ++entry.reconnectAttempt));
       entry.nextReconnectAt = new Date(Date.now() + retryDelay).toISOString();
-      entry.reconnectTimer = setTimeout(open, retryDelay);
+      entry.reconnectTimer = setTimeout(() => {
+        entry.reconnectTimer = null;
+        if (entry.aborted || entry.disabled) return;
+        if (jellyfinRealtimeSockets.get(key) !== entry) return;
+        open();
+      }, retryDelay);
     });
 
     socket.on('error', (error) => {
@@ -966,29 +1097,44 @@ function connectJellyfinRealtimeSocket(serverConfig, userConfig) {
   open();
 }
 
+let reconcileInFlight = false;
+let reconcilePending = false;
 function reconcileJellyfinRealtimeSockets() {
-  appConfig = storage.getConfig();
-  const desiredKeys = new Set();
-  const servers = Array.isArray(appConfig.servers) ? appConfig.servers : [];
-  servers.forEach((server) => {
-    const users = Array.isArray(server.users) ? server.users.filter((user) => user && user.access_token) : [];
-    users.forEach((user) => {
-      const key = buildJellyfinSocketKey(server, user);
-      desiredKeys.add(key);
-      connectJellyfinRealtimeSocket(server, user);
+  if (reconcileInFlight) {
+    reconcilePending = true;
+    return;
+  }
+  reconcileInFlight = true;
+  try {
+    appConfig = storage.getConfig();
+    const desiredKeys = new Set();
+    const servers = Array.isArray(appConfig.servers) ? appConfig.servers : [];
+    servers.forEach((server) => {
+      const users = Array.isArray(server.users) ? server.users.filter((user) => user && user.access_token) : [];
+      users.forEach((user) => {
+        const key = buildJellyfinSocketKey(server, user);
+        desiredKeys.add(key);
+        connectJellyfinRealtimeSocket(server, user);
+      });
     });
-  });
 
-  Array.from(jellyfinRealtimeSockets.entries()).forEach(([key, entry]) => {
-    if (desiredKeys.has(key)) return;
-    entry.closedManually = true;
-    if (entry.refreshTimer) clearTimeout(entry.refreshTimer);
-    if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
-    try { entry.socket && entry.socket.close(); } catch (_) {}
-    jellyfinRealtimeSockets.delete(key);
-  });
-
-  refreshRealtimeSocketSummary();
+    Array.from(jellyfinRealtimeSockets.entries()).forEach(([key, entry]) => {
+      if (desiredKeys.has(key)) return;
+      entry.aborted = true;
+      entry.closedManually = true;
+      if (entry.refreshTimer) clearTimeout(entry.refreshTimer);
+      if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
+      try { entry.socket && entry.socket.close(); } catch (_) {}
+      jellyfinRealtimeSockets.delete(key);
+    });
+    refreshRealtimeSocketSummary();
+  } finally {
+    reconcileInFlight = false;
+    if (reconcilePending) {
+      reconcilePending = false;
+      setImmediate(reconcileJellyfinRealtimeSockets);
+    }
+  }
 }
 
 async function runAnalyticsSync(reason) {
@@ -1343,12 +1489,36 @@ function parseCookies(req) {
 // Admin authentication (opt-in)
 // ---------------------------------------------------------------------------
 const ADMIN_PASSWORD = process.env.COMPANION_ADMIN_PASSWORD || null;
+const ADMIN_SESSION_TTL_MS = Math.max(
+  5 * 60_000,
+  Number(process.env.COMPANION_SESSION_TTL_MS) || 12 * 60 * 60 * 1000
+);
+const ADMIN_SESSION_REMEMBER_TTL_MS = Math.max(
+  ADMIN_SESSION_TTL_MS,
+  Number(process.env.COMPANION_SESSION_REMEMBER_TTL_MS) || 30 * 24 * 60 * 60 * 1000
+);
+const ADMIN_COOKIE_SECURE = process.env.COMPANION_COOKIE_SECURE === '1'
+  || process.env.COMPANION_COOKIE_SECURE === 'true';
 
+function buildSessionCookie(token, maxAgeMs) {
+  const parts = [`session=${token}`, 'HttpOnly', 'Path=/', 'SameSite=Strict'];
+  if (ADMIN_COOKIE_SECURE) parts.push('Secure');
+  if (Number.isFinite(maxAgeMs) && maxAgeMs > 0) {
+    parts.push(`Max-Age=${Math.floor(maxAgeMs / 1000)}`);
+  }
+  return parts.join('; ');
+}
+
+function buildLogoutCookie() {
+  const parts = ['session=', 'HttpOnly', 'Path=/', 'SameSite=Strict', 'Max-Age=0'];
+  if (ADMIN_COOKIE_SECURE) parts.push('Secure');
+  return parts.join('; ');
+}
 
 function adminAuth(req, res, next) {
   if (!ADMIN_PASSWORD) return next();
-  // Exempt login endpoint
-  if (req.path === '/login' || req.path === '/auth-check') return next();
+  // Exempt login + auth-check + logout (logout should never 401)
+  if (req.path === '/login' || req.path === '/auth-check' || req.path === '/logout') return next();
   const cookies = parseCookies(req);
   const token = cookies['session'];
   if (token && storage.validateAdminSession(token)) return next();
@@ -1377,17 +1547,34 @@ const loginLimiter = rateLimit({
 });
 
 adminRouter.post('/login', loginLimiter, (req, res) => {
-  const { password } = req.body;
+  const { password, remember } = req.body || {};
   if (!ADMIN_PASSWORD) {
     return res.json({ authenticated: true });
   }
-  if (password !== ADMIN_PASSWORD) {
+  const provided = typeof password === 'string' ? password : '';
+  const expected = ADMIN_PASSWORD;
+  const providedBuf = Buffer.from(provided, 'utf8');
+  const expectedBuf = Buffer.from(expected, 'utf8');
+  const match = providedBuf.length === expectedBuf.length
+    && crypto.timingSafeEqual(providedBuf, expectedBuf);
+  if (!match) {
+    storage.recordEvent('admin-login-failed', req, { ip: req.ip });
     return res.status(401).json({ error: 'Invalid password' });
   }
   const token = crypto.randomBytes(32).toString('hex');
-  storage.createAdminSession(token);
-  res.setHeader('Set-Cookie', `session=${token}; HttpOnly; Path=/`);
-  res.json({ authenticated: true });
+  const ttl = remember ? ADMIN_SESSION_REMEMBER_TTL_MS : ADMIN_SESSION_TTL_MS;
+  storage.createAdminSession(token, ttl);
+  storage.recordEvent('admin-login-success', req, { remember: !!remember });
+  res.setHeader('Set-Cookie', buildSessionCookie(token, ttl));
+  res.json({ authenticated: true, expiresInMs: ttl });
+});
+
+adminRouter.post('/logout', (req, res) => {
+  const cookies = parseCookies(req);
+  const token = cookies['session'];
+  if (token) storage.deleteAdminSession(token);
+  res.setHeader('Set-Cookie', buildLogoutCookie());
+  res.json({ ok: true });
 });
 
 adminRouter.get('/auth-check', (req, res) => {
@@ -1407,9 +1594,68 @@ adminRouter.get('/auth-check', (req, res) => {
 // ---------------------------------------------------------------------------
 adminRouter.get('/config', (req, res) => res.json(appConfig));
 
+function validateConfigPatch(body) {
+  const errors = [];
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { errors: ['Request body must be a JSON object.'] };
+  }
+  const { globalPreferences, devicePreferences, servers, networkShares } = body;
+  if (globalPreferences !== undefined && (
+    typeof globalPreferences !== 'object' || Array.isArray(globalPreferences) || globalPreferences === null
+  )) {
+    errors.push('globalPreferences must be an object.');
+  }
+  if (devicePreferences !== undefined) {
+    if (typeof devicePreferences !== 'object' || Array.isArray(devicePreferences) || devicePreferences === null) {
+      errors.push('devicePreferences must be an object keyed by deviceId.');
+    } else {
+      for (const [deviceId, overrides] of Object.entries(devicePreferences)) {
+        if (!deviceId || typeof deviceId !== 'string') {
+          errors.push('devicePreferences keys must be non-empty device IDs.');
+          continue;
+        }
+        if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
+          errors.push(`devicePreferences["${deviceId}"] must be an object.`);
+        }
+      }
+    }
+  }
+  if (servers !== undefined && !Array.isArray(servers)) {
+    errors.push('servers must be an array.');
+  } else if (Array.isArray(servers)) {
+    servers.forEach((server, idx) => {
+      if (!server || typeof server !== 'object' || Array.isArray(server)) {
+        errors.push(`servers[${idx}] must be an object.`);
+        return;
+      }
+      if (server.users !== undefined && !Array.isArray(server.users)) {
+        errors.push(`servers[${idx}].users must be an array.`);
+      }
+      if (server.addresses !== undefined && !Array.isArray(server.addresses)) {
+        errors.push(`servers[${idx}].addresses must be an array.`);
+      }
+    });
+  }
+  if (networkShares !== undefined && !Array.isArray(networkShares)) {
+    errors.push('networkShares must be an array.');
+  } else if (Array.isArray(networkShares)) {
+    networkShares.forEach((share, idx) => {
+      if (!share || typeof share !== 'object' || Array.isArray(share)) {
+        errors.push(`networkShares[${idx}] must be an object.`);
+      }
+    });
+  }
+  return { errors };
+}
+
 adminRouter.post('/config', (req, res) => {
-  const { globalPreferences, servers, networkShares } = req.body;
+  const { errors } = validateConfigPatch(req.body);
+  if (errors.length) {
+    return res.status(400).json({ error: 'Invalid configuration payload', details: errors });
+  }
+  const { globalPreferences, devicePreferences, servers, networkShares } = req.body;
   if (globalPreferences) appConfig.globalPreferences = globalPreferences;
+  if (devicePreferences) appConfig.devicePreferences = devicePreferences;
   if (servers) appConfig.servers = servers;
   if (networkShares) appConfig.networkShares = networkShares;
   appConfig = storage.saveConfig(appConfig, {
@@ -1422,8 +1668,68 @@ adminRouter.post('/config', (req, res) => {
     }
   });
   reconcileJellyfinRealtimeSockets();
+  broadcastConfigChanged();
   res.json({ status: 'ok' });
 });
+
+// Dedicated endpoints for per-device preference overrides. Having them
+// separate from the big config endpoint lets the admin UI update a single
+// device without round-tripping the whole payload, and lets us target the
+// change broadcast precisely.
+adminRouter.put('/device-preferences/:deviceId', (req, res) => {
+  const deviceId = String(req.params.deviceId || '').trim();
+  if (!deviceId) return res.status(400).json({ error: 'Missing deviceId' });
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return res.status(400).json({ error: 'Body must be an object of preference key/value pairs' });
+  }
+  const current = appConfig.devicePreferences || {};
+  const existing = (current[deviceId] && typeof current[deviceId] === 'object') ? current[deviceId] : {};
+  // Merge: keys explicitly set to null clear the override; others overwrite.
+  const next = { ...existing };
+  for (const [k, v] of Object.entries(body)) {
+    if (typeof k !== 'string' || k.length === 0) continue;
+    if (v === null || v === undefined) {
+      delete next[k];
+    } else if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+      next[k] = String(v);
+    }
+  }
+  const nextDevicePrefs = { ...current };
+  if (Object.keys(next).length === 0) delete nextDevicePrefs[deviceId];
+  else nextDevicePrefs[deviceId] = next;
+  appConfig.devicePreferences = nextDevicePrefs;
+  appConfig = storage.saveConfig(appConfig, {
+    reason: 'device-preferences-update',
+    eventType: 'device_preferences_updated',
+    req,
+    details: { deviceId, keys: Object.keys(next) }
+  });
+  broadcastConfigChanged(deviceId);
+  res.json({ status: 'ok', deviceId, overrides: next });
+});
+
+adminRouter.delete('/device-preferences/:deviceId', (req, res) => {
+  const deviceId = String(req.params.deviceId || '').trim();
+  if (!deviceId) return res.status(400).json({ error: 'Missing deviceId' });
+  const current = appConfig.devicePreferences || {};
+  if (!current[deviceId]) return res.json({ status: 'ok', deviceId, cleared: false });
+  const next = { ...current };
+  delete next[deviceId];
+  appConfig.devicePreferences = next;
+  appConfig = storage.saveConfig(appConfig, {
+    reason: 'device-preferences-clear',
+    eventType: 'device_preferences_cleared',
+    req,
+    details: { deviceId }
+  });
+  broadcastConfigChanged(deviceId);
+  res.json({ status: 'ok', deviceId, cleared: true });
+});
+
+function broadcastConfigChanged(deviceId = null) {
+  broadcastAdminEvent({ type: 'config_changed', deviceId });
+}
 
 adminRouter.get('/qr', async (req, res) => {
   const host = req.query.host || getLocalIp();
@@ -1809,17 +2115,92 @@ adminRouter.post('/config/snapshots/restore', (req, res) => {
   }
 });
 
+const SECRET_PREF_KEYS = new Set([
+  'pref_tmdb_api_key',
+  'pref_omdb_api_key',
+  'pref_voice_assistant_cloud_api_key'
+]);
+const SECRET_PLACEHOLDER = '***REDACTED***';
+
+function redactConfigForExport(config) {
+  const clone = JSON.parse(JSON.stringify(config || {}));
+  if (clone.globalPreferences && typeof clone.globalPreferences === 'object') {
+    for (const key of Object.keys(clone.globalPreferences)) {
+      if (SECRET_PREF_KEYS.has(key) && clone.globalPreferences[key]) {
+        clone.globalPreferences[key] = SECRET_PLACEHOLDER;
+      }
+    }
+  }
+  if (Array.isArray(clone.servers)) {
+    clone.servers.forEach((server) => {
+      if (!server || typeof server !== 'object') return;
+      if (Array.isArray(server.users)) {
+        server.users.forEach((user) => {
+          if (user && user.access_token) user.access_token = SECRET_PLACEHOLDER;
+          if (user && user.password) delete user.password;
+        });
+      }
+    });
+  }
+  if (Array.isArray(clone.networkShares)) {
+    clone.networkShares.forEach((share) => {
+      if (share && share.password) share.password = SECRET_PLACEHOLDER;
+    });
+  }
+  if (clone.setup_token) clone.setup_token = SECRET_PLACEHOLDER;
+  return clone;
+}
+
 adminRouter.get('/config/export', (req, res) => {
   res.setHeader('Content-Disposition', 'attachment; filename="spatialfin-config.json"');
-  res.json(appConfig);
+  const includeSecrets = req.query.includeSecrets === '1' || req.query.includeSecrets === 'true';
+  const payload = includeSecrets ? appConfig : redactConfigForExport(appConfig);
+  res.json(payload);
 });
+
+function restoreRedactedSecrets(imported, current) {
+  // Replace redacted placeholders with the existing values so partial exports
+  // can be re-imported without losing credentials.
+  if (imported.globalPreferences && typeof imported.globalPreferences === 'object'
+      && current && current.globalPreferences) {
+    for (const key of Object.keys(imported.globalPreferences)) {
+      if (SECRET_PREF_KEYS.has(key) && imported.globalPreferences[key] === SECRET_PLACEHOLDER) {
+        imported.globalPreferences[key] = current.globalPreferences[key] || '';
+      }
+    }
+  }
+  if (Array.isArray(imported.servers) && Array.isArray(current && current.servers)) {
+    const byId = new Map(current.servers.map((s) => [s.id, s]));
+    imported.servers.forEach((server) => {
+      const existing = byId.get(server && server.id);
+      if (!existing || !Array.isArray(server.users)) return;
+      const existingUsers = new Map((existing.users || []).map((u) => [u.username || u.name, u]));
+      server.users.forEach((user) => {
+        if (!user) return;
+        if (user.access_token === SECRET_PLACEHOLDER) {
+          const prev = existingUsers.get(user.username || user.name);
+          user.access_token = (prev && prev.access_token) || '';
+        }
+      });
+    });
+  }
+  if (imported.setup_token === SECRET_PLACEHOLDER && current && current.setup_token) {
+    imported.setup_token = current.setup_token;
+  }
+  return imported;
+}
 
 adminRouter.post('/config/import', (req, res) => {
   try {
-    const imported = req.body;
+    let imported = req.body;
     if (!imported || typeof imported !== 'object' || Array.isArray(imported)) {
       return res.status(400).json({ error: 'Invalid config: must be a JSON object' });
     }
+    const { errors } = validateConfigPatch(imported);
+    if (errors.length) {
+      return res.status(400).json({ error: 'Invalid configuration payload', details: errors });
+    }
+    imported = restoreRedactedSecrets(imported, appConfig);
     if (imported.globalPreferences) {
       appConfig.globalPreferences = { ...appConfig.globalPreferences, ...imported.globalPreferences };
     }
@@ -1829,7 +2210,7 @@ adminRouter.post('/config/import', (req, res) => {
     if (imported.networkShares) {
       appConfig.networkShares = imported.networkShares;
     }
-    if (imported.setup_token) {
+    if (imported.setup_token && typeof imported.setup_token === 'string') {
       appConfig.setup_token = imported.setup_token;
     }
     appConfig = storage.saveConfig(appConfig, {
@@ -1841,6 +2222,7 @@ adminRouter.post('/config/import', (req, res) => {
         importedShares: Array.isArray(imported.networkShares) ? imported.networkShares.length : 0
       }
     });
+    reconcileJellyfinRealtimeSockets();
     res.json({ status: 'ok', config: appConfig });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1877,12 +2259,12 @@ adminRouter.get('/device-logs/:deviceId/download', (req, res) => {
     return res.status(404).json({ error: 'Device logs not found' });
   }
   const { device, entries } = result;
-  const safeName = (device.deviceName || device.deviceId || 'spatialfin-device')
+  const safeName = (device.customName || device.deviceName || device.deviceId || 'spatialfin-device')
     .replace(/[^a-z0-9-_]+/gi, '-')
     .replace(/^-+|-+$/g, '')
     .toLowerCase() || 'spatialfin-device';
   const lines = [
-    `Device: ${device.deviceName || device.deviceId}`,
+    `Device: ${device.customName || device.deviceName || device.deviceId}`,
     `Device ID: ${device.deviceId}`,
     `Model: ${device.manufacturer ? device.manufacturer + ' ' : ''}${device.model || ''}`.trim(),
     `App Version: ${device.appVersion || '-'}`,
@@ -1903,6 +2285,39 @@ adminRouter.get('/device-logs/:deviceId/download', (req, res) => {
 adminRouter.delete('/device-logs/:deviceId', (req, res) => {
   storage.clearDeviceLogs(req.params.deviceId);
   res.json({ status: 'ok' });
+});
+
+adminRouter.patch('/devices/:deviceId', (req, res) => {
+  const name = typeof (req.body && req.body.customName) === 'string' ? req.body.customName : '';
+  if (name.length > 160) {
+    return res.status(400).json({ error: 'Name too long (max 160 characters)' });
+  }
+  const result = storage.renameDevice(req.params.deviceId, name);
+  if (!result.changes) {
+    return res.status(404).json({ error: 'Device not found' });
+  }
+  res.json({ status: 'ok', customName: result.customName });
+});
+
+adminRouter.delete('/devices/:deviceId', (req, res) => {
+  const result = storage.deleteDevice(req.params.deviceId);
+  if (!result.changes) {
+    return res.status(404).json({ error: 'Device not found' });
+  }
+  res.json({ status: 'ok' });
+});
+
+adminRouter.post('/device-logs/prune', (req, res) => {
+  const days = Number(req.body && req.body.olderThanDays);
+  if (!Number.isFinite(days) || days <= 0) {
+    return res.status(400).json({ error: 'olderThanDays must be a positive number' });
+  }
+  try {
+    const result = storage.pruneDeviceLogsOlderThan(days);
+    res.json({ status: 'ok', ...result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 adminRouter.get('/analytics/overview', (req, res) => {
@@ -2067,6 +2482,53 @@ adminRouter.get('/analytics/history', (req, res) => {
   });
 });
 
+adminRouter.delete('/analytics/history', (req, res) => {
+  const result = storage.clearAllPlaybackSessions();
+  res.json({ status: 'ok', ...result });
+});
+
+adminRouter.delete('/analytics/sessions/:playbackSessionId', (req, res) => {
+  const result = storage.deletePlaybackSession(req.params.playbackSessionId);
+  if (!result.changes) {
+    return res.status(404).json({ error: 'Playback session not found' });
+  }
+  res.json({ status: 'ok' });
+});
+
+adminRouter.post('/analytics/prune', (req, res) => {
+  const days = Number(req.body && req.body.olderThanDays);
+  if (!Number.isFinite(days) || days <= 0) {
+    return res.status(400).json({ error: 'olderThanDays must be a positive number' });
+  }
+  try {
+    const result = storage.prunePlaybackSessionsOlderThan(days);
+    res.json({ status: 'ok', ...result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+adminRouter.get('/database/stats', (req, res) => {
+  res.json(storage.getDatabaseStats());
+});
+
+adminRouter.post('/database/vacuum', (req, res) => {
+  try {
+    storage.vacuumDatabase();
+    res.json({ status: 'ok', ...storage.getDatabaseStats() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const APP_VERSION = (() => {
+  try { return require('./package.json').version || ''; } catch (_) { return ''; }
+})();
+
+app.get('/api/meta', (req, res) => {
+  res.json({ version: APP_VERSION });
+});
+
 app.use('/api/admin', adminRouter);
 
 // ---------------------------------------------------------------------------
@@ -2186,6 +2648,11 @@ setInterval(() => {
     console.error('Analytics sync interval failed:', error);
   });
 }, ANALYTICS_SYNC_INTERVAL_MS);
+
+try { storage.pruneExpiredAdminSessions(); } catch (_) {}
+setInterval(() => {
+  try { storage.pruneExpiredAdminSessions(); } catch (_) {}
+}, 60 * 60 * 1000);
 
 setTimeout(() => {
   runAnalyticsSync('startup').catch((error) => {

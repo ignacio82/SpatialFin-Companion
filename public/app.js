@@ -165,6 +165,14 @@ let autoScrollEnabled = true;
                 .replace(/'/g, '&#39;');
         }
 
+        function formatLibraryLabel(library, fallback) {
+            var name = library && library.libraryName ? String(library.libraryName).trim() : '';
+            if (name) return name;
+            var id = library && library.libraryId ? String(library.libraryId).trim() : '';
+            if (id && /^[0-9a-f]{16,}$/i.test(id)) return fallback || 'Unnamed Library';
+            return id || (fallback || 'Unnamed Library');
+        }
+
         function resetSmbBrowserResults() {
             shareDiscovery.smbBrowser.hasLoaded = false;
             shareDiscovery.smbBrowser.loading = false;
@@ -296,8 +304,9 @@ let autoScrollEnabled = true;
             if (overlay && overlay.classList.contains('open')) overlay.classList.remove('open');
             
             if (id === 'device-logs') loadDeviceLogs();
-            if (id === 'analytics') loadAnalyticsOverview(true);
+            if (id === 'analytics') { loadAnalyticsOverview(true); loadDatabaseStats(); }
             if (id === 'history') loadSnapshots();
+            if (id === 'security') loadSecurity();
         }
 
         // ── Hamburger / sidebar toggle ──
@@ -851,7 +860,7 @@ let autoScrollEnabled = true;
                 libraryEl.innerHTML = libraries.map(function(library, index) {
                     return '<div class="analytics-ranking-item">' +
                         '<div class="analytics-ranking-main">' +
-                            '<div class="analytics-ranking-title">#' + (index + 1) + ' ' + escapeHtml(library.libraryName || library.libraryId || 'Unknown Library') + '</div>' +
+                            '<div class="analytics-ranking-title">#' + (index + 1) + ' ' + escapeHtml(formatLibraryLabel(library, 'Unnamed Library')) + '</div>' +
                             '<div class="analytics-ranking-meta">Sessions: ' + escapeHtml(String(library.sessionCount || 0)) + ' • Items: ' + escapeHtml(String(library.uniqueItems || 0)) + '</div>' +
                             createSparkBar(Number(library.totalPlayDurationMs) || 0, maxLibraryDuration, 'analytics-bar-fill-library') +
                         '</div>' +
@@ -1137,21 +1146,156 @@ let autoScrollEnabled = true;
                 var data = await res.json();
                 var history = Array.isArray(data.history) ? data.history : [];
                 if (!history.length) {
-                    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;">No watch history matches the current filters.</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);text-align:center;">No watch history matches the current filters.</td></tr>';
                     return;
                 }
                 tbody.innerHTML = history.map(function(entry) {
+                    var sessionId = entry.playbackSessionId ? encodeURIComponent(entry.playbackSessionId) : '';
+                    var deleteBtn = sessionId
+                        ? '<button class="danger" style="padding:4px 10px;" onclick="deleteWatchHistoryEntry(decodeURIComponent(\'' + sessionId + '\'))">Delete</button>'
+                        : '';
                     return '<tr>' +
                         '<td>' + escapeHtml(entry.lastSeenAt ? new Date(entry.lastSeenAt).toLocaleString() : 'Unknown') + '</td>' +
                         '<td>' + analyticsEntityButton('item', entry.itemId || entry.itemName, entry.itemName || entry.itemId || 'Unknown Item') + '</td>' +
                         '<td>' + analyticsEntityButton('user', entry.userId || entry.username, entry.username || entry.userId || 'Unknown User') + '</td>' +
-                        '<td>' + escapeHtml(entry.libraryName || entry.libraryId || 'Unknown Library') + '</td>' +
+                        '<td>' + escapeHtml(formatLibraryLabel(entry, 'Unnamed Library')) + '</td>' +
                         '<td>' + escapeHtml(formatDurationMs(entry.playDurationMs)) + '</td>' +
                         '<td>' + escapeHtml((entry.completed ? 'Completed' : 'In Progress') + ((entry.sessionCount || 1) > 1 ? ' • ' + entry.sessionCount + ' merged' : '')) + '</td>' +
+                        '<td style="text-align:right;">' + deleteBtn + '</td>' +
                     '</tr>';
                 }).join('');
             } catch (e) {
-                tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;">Could not load watch history.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);text-align:center;">Could not load watch history.</td></tr>';
+            }
+        }
+
+        async function deleteWatchHistoryEntry(playbackSessionId) {
+            if (!playbackSessionId) return;
+            if (!confirm('Delete this playback session from history?')) return;
+            try {
+                var res = await fetch('/api/admin/analytics/sessions/' + encodeURIComponent(playbackSessionId), { method: 'DELETE' });
+                if (!res.ok) throw new Error('Delete failed');
+                showToast('Session deleted', 'success');
+                loadWatchHistory();
+                loadAnalyticsOverview(true);
+            } catch (e) {
+                showToast('Could not delete session', 'error');
+            }
+        }
+
+        async function clearAllWatchHistory() {
+            if (!confirm('Delete ALL watch history? This cannot be undone.')) return;
+            try {
+                var res = await fetch('/api/admin/analytics/history', { method: 'DELETE' });
+                if (!res.ok) throw new Error('Clear failed');
+                var data = await res.json();
+                showToast('Cleared ' + (data.deleted || 0) + ' sessions', 'success');
+                loadWatchHistory();
+                loadAnalyticsOverview(true);
+                loadDatabaseStats();
+            } catch (e) {
+                showToast('Could not clear watch history', 'error');
+            }
+        }
+
+        function formatBytes(bytes) {
+            var n = Number(bytes) || 0;
+            if (n < 1024) return n + ' B';
+            if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+            if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+            return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+        }
+
+        async function loadDatabaseStats() {
+            var container = document.getElementById('database-stats');
+            if (!container) return;
+            try {
+                var res = await fetch('/api/admin/database/stats');
+                if (!res.ok) throw new Error('Unable to load stats');
+                var data = await res.json();
+                var counts = data.counts || {};
+                var pills = [
+                    ['Database Size', formatBytes(data.fileSizeBytes)],
+                    ['Playback Sessions', String(counts.playbackSessions || 0)],
+                    ['Session Events', String(counts.playbackSessionEvents || 0)],
+                    ['Device Log Lines', String(counts.deviceLogs || 0)],
+                    ['Devices', String(counts.devices || 0)],
+                    ['Media Metadata', String(counts.mediaItemMetadata || 0)]
+                ];
+                if (data.oldestPlaybackAt) {
+                    pills.push(['Oldest Session', new Date(data.oldestPlaybackAt).toLocaleDateString()]);
+                }
+                if (data.oldestDeviceLogAt) {
+                    pills.push(['Oldest Log', new Date(data.oldestDeviceLogAt).toLocaleDateString()]);
+                }
+                container.innerHTML = pills.map(function(pair) {
+                    return '<div class="analytics-detail-pill">' + escapeHtml(pair[0]) + ': ' + escapeHtml(pair[1]) + '</div>';
+                }).join('');
+            } catch (e) {
+                container.innerHTML = '<div class="log-meta">Could not load database stats.</div>';
+            }
+        }
+
+        function readRetentionDays() {
+            var input = document.getElementById('database-retention-days');
+            var days = Number(input && input.value);
+            if (!Number.isFinite(days) || days <= 0) {
+                showToast('Enter a positive number of days', 'error');
+                return null;
+            }
+            return days;
+        }
+
+        async function pruneAnalytics() {
+            var days = readRetentionDays();
+            if (days === null) return;
+            if (!confirm('Delete playback sessions older than ' + days + ' days? This cannot be undone.')) return;
+            try {
+                var res = await fetch('/api/admin/analytics/prune', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ olderThanDays: days })
+                });
+                if (!res.ok) throw new Error('Prune failed');
+                var data = await res.json();
+                showToast('Deleted ' + (data.deleted || 0) + ' sessions', 'success');
+                loadDatabaseStats();
+                loadAnalyticsOverview(true);
+                loadWatchHistory();
+            } catch (e) {
+                showToast('Could not prune analytics', 'error');
+            }
+        }
+
+        async function pruneDeviceLogs() {
+            var days = readRetentionDays();
+            if (days === null) return;
+            if (!confirm('Delete device log lines older than ' + days + ' days? This cannot be undone.')) return;
+            try {
+                var res = await fetch('/api/admin/device-logs/prune', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ olderThanDays: days })
+                });
+                if (!res.ok) throw new Error('Prune failed');
+                var data = await res.json();
+                showToast('Deleted ' + (data.deleted || 0) + ' log lines', 'success');
+                loadDatabaseStats();
+                loadDeviceLogs();
+            } catch (e) {
+                showToast('Could not prune device logs', 'error');
+            }
+        }
+
+        async function vacuumDatabase() {
+            if (!confirm('Run VACUUM now? This may take a moment on large databases.')) return;
+            try {
+                var res = await fetch('/api/admin/database/vacuum', { method: 'POST' });
+                if (!res.ok) throw new Error('VACUUM failed');
+                showToast('Database vacuumed', 'success');
+                loadDatabaseStats();
+            } catch (e) {
+                showToast('VACUUM failed', 'error');
             }
         }
 
@@ -1215,7 +1359,7 @@ let autoScrollEnabled = true;
                         '<div class="analytics-entity-row-meta">' +
                             escapeHtml(entry.lastSeenAt ? new Date(entry.lastSeenAt).toLocaleString() : 'Unknown') +
                             ' • ' + escapeHtml(formatDurationMs(entry.playDurationMs)) +
-                            ' • ' + escapeHtml(entry.libraryName || entry.libraryId || 'Unknown Library') +
+                            ' • ' + escapeHtml(formatLibraryLabel(entry, 'Unnamed Library')) +
                             ((entry.sessionCount || 1) > 1 ? ' • ' + escapeHtml(String(entry.sessionCount)) + ' merged' : '') +
                         '</div>' +
                         createSparkBar(Number(entry.playDurationMs) || 0, maxHistoryDuration, type === 'user' ? 'analytics-bar-fill-item' : 'analytics-bar-fill-user') +
@@ -1252,21 +1396,74 @@ let autoScrollEnabled = true;
             }
             listEl.innerHTML = '';
             devices.forEach(function(device) {
+                var wrapper = document.createElement('div');
+                wrapper.className = 'log-device-item-wrapper';
                 var item = document.createElement('button');
                 item.type = 'button';
                 item.className = 'log-device-item' + (device.deviceId === selectedLogDeviceId ? ' active' : '');
                 item.onclick = function() { selectLogDevice(device.deviceId); };
+                var displayName = device.customName || device.deviceName || device.deviceId;
+                var renamedBadge = device.customName
+                    ? ' <span class="log-meta" style="font-weight:400;">(renamed from ' + escapeHtml(device.deviceName || device.deviceId) + ')</span>'
+                    : '';
                 item.innerHTML =
                     '<div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;">' +
                         '<div>' +
-                            '<div style="font-weight:600;">' + escapeHtml(device.deviceName || device.deviceId) + '</div>' +
+                            '<div style="font-weight:600;">' + escapeHtml(displayName) + renamedBadge + '</div>' +
                             '<div class="log-meta">' + escapeHtml(device.appVersion || 'Unknown app version') + '</div>' +
                         '</div>' +
                         '<div class="log-meta">' + escapeHtml(String(device.entryCount || 0)) + ' lines</div>' +
                     '</div>' +
                     '<div class="log-meta" style="margin-top:10px;">Last upload: ' + escapeHtml(device.latestEntryAt ? new Date(device.latestEntryAt).toLocaleString() : 'Unknown') + '</div>';
-                listEl.appendChild(item);
+                wrapper.appendChild(item);
+                var actions = document.createElement('div');
+                actions.className = 'log-device-actions';
+                var encodedId = encodeURIComponent(device.deviceId);
+                actions.innerHTML =
+                    '<button type="button" class="secondary" style="padding:4px 10px;font-size:0.8rem;" onclick="renameLogDevice(decodeURIComponent(\'' + encodedId + '\'))">Rename</button>' +
+                    '<button type="button" class="danger" style="padding:4px 10px;font-size:0.8rem;" onclick="deleteLogDevice(decodeURIComponent(\'' + encodedId + '\'))">Remove Device</button>';
+                wrapper.appendChild(actions);
+                listEl.appendChild(wrapper);
             });
+        }
+
+        async function renameLogDevice(deviceId) {
+            var devices = (logSummary.devices || []);
+            var device = devices.find(function(d) { return d.deviceId === deviceId; }) || {};
+            var current = device.customName || device.deviceName || '';
+            var next = prompt('Rename device (leave blank to reset to reported name):', current);
+            if (next === null) return;
+            try {
+                var res = await fetch('/api/admin/devices/' + encodeURIComponent(deviceId), {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ customName: next })
+                });
+                if (!res.ok) throw new Error('Rename failed');
+                showToast('Device renamed', 'success');
+                await loadDeviceLogs();
+            } catch (e) {
+                showToast('Could not rename device', 'error');
+            }
+        }
+
+        async function deleteLogDevice(deviceId) {
+            if (!confirm('Remove this device and all of its logs? This cannot be undone.')) return;
+            try {
+                var res = await fetch('/api/admin/devices/' + encodeURIComponent(deviceId), { method: 'DELETE' });
+                if (!res.ok) throw new Error('Delete failed');
+                showToast('Device removed', 'success');
+                if (selectedLogDeviceId === deviceId) {
+                    selectedLogDeviceId = null;
+                    currentDeviceLogs = [];
+                    document.getElementById('log-viewer').textContent = 'Choose a device to view recent log lines.';
+                    document.getElementById('log-viewer-title').textContent = 'Select a device';
+                    document.getElementById('log-viewer-meta').textContent = 'No device selected.';
+                }
+                await loadDeviceLogs();
+            } catch (e) {
+                showToast('Could not remove device', 'error');
+            }
         }
 
         async function loadDeviceLogs() {
@@ -1301,7 +1498,7 @@ let autoScrollEnabled = true;
                 meta.push(device.appVersion || 'Unknown version');
                 if (device.model) meta.push(device.model);
                 if (device.lastSeenAt) meta.push('Last seen ' + new Date(device.lastSeenAt).toLocaleString());
-                document.getElementById('log-viewer-title').textContent = device.deviceName || device.deviceId || 'Device Logs';
+                document.getElementById('log-viewer-title').textContent = device.customName || device.deviceName || device.deviceId || 'Device Logs';
                 document.getElementById('log-viewer-meta').textContent = meta.join(' • ');
                 document.getElementById('download-logs-button').disabled = false;
                 document.getElementById('copy-logs-button').disabled = false;
@@ -1971,6 +2168,179 @@ let autoScrollEnabled = true;
             });
         }
 
+        // --- Security panel ------------------------------------------------
+        // The app-lock prefs are NOT in default-preferences on purpose. They
+        // are absent from globalPreferences unless the admin enforces them.
+        // An empty value in the mode selector means "not enforced" — we
+        // delete the key so it doesn't appear in the sync payload and
+        // devices keep their local choice.
+        const SECURITY_KEYS = {
+            mode: 'pref_app_lock_mode',
+            wipe: 'pref_app_lock_wipe_on_fail',
+            attempts: 'pref_app_lock_max_attempts',
+        };
+
+        function readGlobalSecurity() {
+            var gp = (configData && configData.globalPreferences) || {};
+            return {
+                mode: gp[SECURITY_KEYS.mode] || '',
+                wipe: gp[SECURITY_KEYS.wipe] === 'true',
+                attempts: Number(gp[SECURITY_KEYS.attempts] || 1),
+            };
+        }
+
+        async function loadSecurity() {
+            if (!configData) return;
+            var sec = readGlobalSecurity();
+            var modeEl = document.getElementById('sec_global_mode');
+            var wipeEl = document.getElementById('sec_global_wipe');
+            var attemptsEl = document.getElementById('sec_global_attempts');
+            if (modeEl) modeEl.value = sec.mode;
+            if (wipeEl) wipeEl.checked = sec.wipe;
+            if (attemptsEl) attemptsEl.value = Math.min(3, Math.max(1, sec.attempts));
+            await renderSecurityDeviceList();
+        }
+
+        async function renderSecurityDeviceList() {
+            var container = document.getElementById('sec_device_list');
+            if (!container) return;
+            container.innerHTML = '<div class="log-meta">Loading devices…</div>';
+            try {
+                var res = await fetch('/api/admin/device-logs');
+                if (!res.ok) {
+                    container.innerHTML = '<div class="log-meta">Failed to load devices.</div>';
+                    return;
+                }
+                var data = await res.json();
+                var devices = (data && Array.isArray(data.devices)) ? data.devices : [];
+                if (devices.length === 0) {
+                    container.innerHTML = '<div class="log-meta">No devices have synced yet. A device will appear here once it uploads logs or syncs config.</div>';
+                    return;
+                }
+                var overrides = (configData && configData.devicePreferences) || {};
+                container.innerHTML = devices.map(function(d) {
+                    var id = d.deviceId;
+                    var override = overrides[id] || {};
+                    var mode = override[SECURITY_KEYS.mode] || '';
+                    var wipe = override[SECURITY_KEYS.wipe] === 'true';
+                    var attempts = Number(override[SECURITY_KEYS.attempts] || 1);
+                    var safeId = encodeURIComponent(id);
+                    return (
+                        '<div class="setting-row" style="flex-direction:column;align-items:stretch;gap:8px;border-top:1px solid var(--border);padding-top:12px;">' +
+                          '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;">' +
+                            '<div>' +
+                              '<strong>' + escapeHtml(d.deviceName || d.deviceId) + '</strong>' +
+                              '<div class="log-meta">' + escapeHtml(d.deviceId) + '</div>' +
+                            '</div>' +
+                            '<button class="secondary" onclick="clearDeviceSecurityOverride(\'' + safeId + '\')">Clear override</button>' +
+                          '</div>' +
+                          '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;">' +
+                            '<label>Mode: ' +
+                              '<select id="sec_dev_mode_' + safeId + '">' +
+                                '<option value=""' + (mode === '' ? ' selected' : '') + '>Not overridden</option>' +
+                                '<option value="off"' + (mode === 'off' ? ' selected' : '') + '>Off</option>' +
+                                '<option value="biometric"' + (mode === 'biometric' ? ' selected' : '') + '>Biometric</option>' +
+                                '<option value="pin"' + (mode === 'pin' ? ' selected' : '') + '>PIN</option>' +
+                              '</select>' +
+                            '</label>' +
+                            '<label>Wipe on fail: <input type="checkbox" id="sec_dev_wipe_' + safeId + '"' + (wipe ? ' checked' : '') + '></label>' +
+                            '<label>Attempts: <input type="number" min="1" max="3" step="1" id="sec_dev_attempts_' + safeId + '" value="' + attempts + '" style="width:60px;"></label>' +
+                            '<button onclick="saveDeviceSecurityOverride(\'' + safeId + '\')">Save</button>' +
+                          '</div>' +
+                        '</div>'
+                    );
+                }).join('');
+            } catch (err) {
+                container.innerHTML = '<div class="log-meta">Error loading devices: ' + escapeHtml(err.message || String(err)) + '</div>';
+            }
+        }
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, function(c) {
+                return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c];
+            });
+        }
+
+        async function saveSecurityGlobals() {
+            if (!configData) return;
+            var modeEl = document.getElementById('sec_global_mode');
+            var wipeEl = document.getElementById('sec_global_wipe');
+            var attemptsEl = document.getElementById('sec_global_attempts');
+            var gp = { ...(configData.globalPreferences || {}) };
+            var mode = modeEl ? modeEl.value : '';
+            if (mode) {
+                gp[SECURITY_KEYS.mode] = mode;
+                gp[SECURITY_KEYS.wipe] = wipeEl && wipeEl.checked ? 'true' : 'false';
+                var att = attemptsEl ? Math.min(3, Math.max(1, Number(attemptsEl.value) || 1)) : 1;
+                gp[SECURITY_KEYS.attempts] = String(att);
+            } else {
+                delete gp[SECURITY_KEYS.mode];
+                delete gp[SECURITY_KEYS.wipe];
+                delete gp[SECURITY_KEYS.attempts];
+            }
+            var res = await fetch('/api/admin/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ globalPreferences: gp }),
+            });
+            if (res.ok) {
+                configData.globalPreferences = gp;
+                if (typeof showToast === 'function') showToast('Security settings saved.');
+            } else {
+                alert('Failed to save security settings');
+            }
+        }
+        window.saveSecurityGlobals = saveSecurityGlobals;
+
+        async function saveDeviceSecurityOverride(encodedDeviceId) {
+            var deviceId = decodeURIComponent(encodedDeviceId);
+            var safeId = encodedDeviceId;
+            var modeEl = document.getElementById('sec_dev_mode_' + safeId);
+            var wipeEl = document.getElementById('sec_dev_wipe_' + safeId);
+            var attemptsEl = document.getElementById('sec_dev_attempts_' + safeId);
+            var body = {};
+            var mode = modeEl ? modeEl.value : '';
+            if (mode) {
+                body[SECURITY_KEYS.mode] = mode;
+                body[SECURITY_KEYS.wipe] = wipeEl && wipeEl.checked ? 'true' : 'false';
+                var att = attemptsEl ? Math.min(3, Math.max(1, Number(attemptsEl.value) || 1)) : 1;
+                body[SECURITY_KEYS.attempts] = String(att);
+            } else {
+                // Empty mode = clear override keys for this device
+                body[SECURITY_KEYS.mode] = null;
+                body[SECURITY_KEYS.wipe] = null;
+                body[SECURITY_KEYS.attempts] = null;
+            }
+            var res = await fetch('/api/admin/device-preferences/' + encodeURIComponent(deviceId), {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            if (res.ok) {
+                await loadConfig();
+                await loadSecurity();
+                if (typeof showToast === 'function') showToast('Device override saved.');
+            } else {
+                alert('Failed to save override');
+            }
+        }
+        window.saveDeviceSecurityOverride = saveDeviceSecurityOverride;
+
+        async function clearDeviceSecurityOverride(encodedDeviceId) {
+            var deviceId = decodeURIComponent(encodedDeviceId);
+            var res = await fetch('/api/admin/device-preferences/' + encodeURIComponent(deviceId), {
+                method: 'DELETE',
+            });
+            if (res.ok) {
+                await loadConfig();
+                await loadSecurity();
+                if (typeof showToast === 'function') showToast('Device override cleared.');
+            } else {
+                alert('Failed to clear override');
+            }
+        }
+        window.clearDeviceSecurityOverride = clearDeviceSecurityOverride;
+
         async function loadAppMeta() {
             try {
                 var res = await fetch('/api/meta');
@@ -2208,6 +2578,12 @@ function connectWebSocket() {
                 loadAnalyticsOverview(false);
             } else if (data.type === 'analytics_sync_completed') {
                 loadAnalyticsOverview(false);
+            } else if (data.type === 'config_changed') {
+                // Another admin or a per-device override just updated the
+                // config. Reload both the main config and the security panel
+                // so the UI reflects the new state without a hard refresh.
+                loadConfig();
+                if (typeof loadSecurity === 'function') loadSecurity();
             }
         } catch (e) {}
     };

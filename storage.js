@@ -84,6 +84,7 @@ function createStorage(options) {
       SELECT
         device_id AS deviceId,
         device_name AS deviceName,
+        custom_name AS customName,
         model,
         manufacturer,
         app_version AS appVersion,
@@ -101,6 +102,7 @@ function createStorage(options) {
       SELECT
         device_id AS deviceId,
         device_name AS deviceName,
+        custom_name AS customName,
         model,
         manufacturer,
         app_version AS appVersion,
@@ -114,10 +116,26 @@ function createStorage(options) {
       FROM devices
       ORDER BY latest_entry_at DESC, last_seen_at DESC, device_name ASC
     `),
+    renameDevice: db.prepare('UPDATE devices SET custom_name = ? WHERE device_id = ?'),
+    deleteDevice: db.prepare('DELETE FROM devices WHERE device_id = ?'),
+    deletePlaybackSession: db.prepare('DELETE FROM playback_sessions WHERE playback_session_id = ?'),
+    deleteAllPlaybackSessions: db.prepare('DELETE FROM playback_sessions'),
+    deleteAllPlaybackSessionEvents: db.prepare('DELETE FROM playback_session_events'),
+    deletePlaybackSessionsOlderThan: db.prepare('DELETE FROM playback_sessions WHERE COALESCE(last_seen_at, started_at) < ?'),
+    deleteEventsOlderThan: db.prepare('DELETE FROM events WHERE created_at < ?'),
+    deleteDeviceLogsOlderThan: db.prepare('DELETE FROM device_logs WHERE received_at < ?'),
+    refreshDeviceEntryCounts: db.prepare(`
+      UPDATE devices
+      SET entry_count = (SELECT COUNT(*) FROM device_logs WHERE device_logs.device_id = devices.device_id),
+          latest_entry_at = (SELECT MAX(timestamp) FROM device_logs WHERE device_logs.device_id = devices.device_id)
+    `),
     clearDeviceLogs: db.prepare('DELETE FROM device_logs WHERE device_id = ?'),
     resetDeviceLogCount: db.prepare('UPDATE devices SET entry_count = 0, latest_entry_at = NULL WHERE device_id = ?'),
-    createSession: db.prepare('INSERT INTO admin_sessions (token, created_at) VALUES (?, ?)'),
-    getSession: db.prepare('SELECT token FROM admin_sessions WHERE token = ?'),
+    createSession: db.prepare('INSERT INTO admin_sessions (token, created_at, expires_at, last_used_at) VALUES (?, ?, ?, ?)'),
+    getSession: db.prepare('SELECT token, expires_at AS expiresAt FROM admin_sessions WHERE token = ?'),
+    deleteSession: db.prepare('DELETE FROM admin_sessions WHERE token = ?'),
+    touchSession: db.prepare('UPDATE admin_sessions SET last_used_at = ? WHERE token = ?'),
+    pruneExpiredSessions: db.prepare('DELETE FROM admin_sessions WHERE expires_at IS NOT NULL AND expires_at <= ?'),
     getSnapshots: db.prepare('SELECT id, created_at, reason FROM config_snapshots ORDER BY id DESC LIMIT 50'),
     getSnapshotById: db.prepare('SELECT config_json FROM config_snapshots WHERE id = ?'),
     getDeviceLogs: db.prepare(`
@@ -504,8 +522,12 @@ function createStorage(options) {
     getDeviceWithLogs,
     upsertDeviceLogs,
     clearDeviceLogs,
+    renameDevice,
+    deleteDevice,
     createAdminSession,
     validateAdminSession,
+    deleteAdminSession,
+    pruneExpiredAdminSessions,
     getConfigSnapshots,
     restoreConfigSnapshot,
     upsertPlaybackSessions,
@@ -522,7 +544,13 @@ function createStorage(options) {
     getWatchHistory,
     closeMissingPlaybackSessions,
     getPlaybackUserDetail,
-    getPlaybackItemDetail
+    getPlaybackItemDetail,
+    deletePlaybackSession,
+    clearAllPlaybackSessions,
+    prunePlaybackSessionsOlderThan,
+    pruneDeviceLogsOlderThan,
+    getDatabaseStats,
+    vacuumDatabase
   };
 
   function initSchema() {
@@ -535,7 +563,9 @@ function createStorage(options) {
 
       CREATE TABLE IF NOT EXISTS admin_sessions (
         token TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        expires_at TEXT,
+        last_used_at TEXT
       );
       
       CREATE TABLE IF NOT EXISTS config_snapshots (
@@ -645,6 +675,16 @@ function createStorage(options) {
       );
       CREATE INDEX IF NOT EXISTS idx_media_item_metadata_item_id ON media_item_metadata(item_id, last_refreshed_at DESC);
     `);
+
+    addColumnIfMissing('admin_sessions', 'expires_at', 'TEXT');
+    addColumnIfMissing('admin_sessions', 'last_used_at', 'TEXT');
+    addColumnIfMissing('devices', 'custom_name', 'TEXT');
+  }
+
+  function addColumnIfMissing(table, column, type) {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+    if (columns.some((c) => c.name === column)) return;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
   }
 
   function migrateLegacyState() {
@@ -695,6 +735,7 @@ function createStorage(options) {
     return normalizeConfig({
       version: 1,
       globalPreferences: { ...defaultPreferences },
+      devicePreferences: {},
       servers: [],
       networkShares: [],
       setup_token: 'sf-setup-' + Math.random().toString(36).substr(2, 9)
@@ -703,12 +744,31 @@ function createStorage(options) {
 
   function normalizeConfig(input) {
     const config = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+    // devicePreferences: { [deviceId]: { [prefKey]: stringValue | null } }
+    // Each inner map is a sparse override over globalPreferences for that device.
+    const rawDevicePrefs = config.devicePreferences && typeof config.devicePreferences === 'object' && !Array.isArray(config.devicePreferences)
+      ? config.devicePreferences
+      : {};
+    const devicePreferences = {};
+    for (const [deviceId, overrides] of Object.entries(rawDevicePrefs)) {
+      if (!deviceId || typeof deviceId !== 'string') continue;
+      if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) continue;
+      const clean = {};
+      for (const [k, v] of Object.entries(overrides)) {
+        if (typeof k !== 'string' || k.length === 0) continue;
+        if (v === null) { clean[k] = null; continue; }
+        if (typeof v === 'string') clean[k] = v;
+        else if (typeof v === 'boolean' || typeof v === 'number') clean[k] = String(v);
+      }
+      if (Object.keys(clean).length > 0) devicePreferences[deviceId] = clean;
+    }
     return {
       version: Number(config.version) || 1,
       globalPreferences: {
         ...defaultPreferences,
         ...(config.globalPreferences && typeof config.globalPreferences === 'object' ? config.globalPreferences : {})
       },
+      devicePreferences,
       servers: Array.isArray(config.servers) ? config.servers : [],
       networkShares: Array.isArray(config.networkShares) ? config.networkShares : [],
       setup_token: typeof config.setup_token === 'string' && config.setup_token
@@ -765,12 +825,37 @@ function createStorage(options) {
   }
 
   
-  function createAdminSession(token) {
-    statements.createSession.run(token, isoNow());
+  function createAdminSession(token, ttlMs) {
+    const now = isoNow();
+    const ttl = Number(ttlMs);
+    // ttlMs === undefined -> no expiry (legacy callers). Any finite number
+    // (including 0/negative) applies an absolute expires_at so tests can
+    // construct already-expired sessions deterministically.
+    const expiresAt = Number.isFinite(ttl)
+      ? new Date(Date.now() + ttl).toISOString()
+      : null;
+    statements.createSession.run(token, now, expiresAt, now);
   }
 
   function validateAdminSession(token) {
-    return !!statements.getSession.get(token);
+    if (!token || typeof token !== 'string') return false;
+    const row = statements.getSession.get(token);
+    if (!row) return false;
+    if (row.expiresAt && row.expiresAt <= isoNow()) {
+      statements.deleteSession.run(token);
+      return false;
+    }
+    statements.touchSession.run(isoNow(), token);
+    return true;
+  }
+
+  function deleteAdminSession(token) {
+    if (!token) return;
+    statements.deleteSession.run(token);
+  }
+
+  function pruneExpiredAdminSessions() {
+    statements.pruneExpiredSessions.run(isoNow());
   }
 
   function getConfigSnapshots() {
@@ -823,6 +908,107 @@ function createStorage(options) {
       db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  function renameDevice(deviceId, customName) {
+    const trimmed = typeof customName === 'string' ? customName.trim() : '';
+    const value = trimmed ? sanitizeText(trimmed, 160) : null;
+    const result = statements.renameDevice.run(value, deviceId);
+    return { changes: result.changes, customName: value };
+  }
+
+  function deleteDevice(deviceId) {
+    db.exec('BEGIN');
+    try {
+      statements.clearDeviceLogs.run(deviceId);
+      const result = statements.deleteDevice.run(deviceId);
+      db.exec('COMMIT');
+      return { changes: result.changes };
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  function deletePlaybackSession(playbackSessionId) {
+    const result = statements.deletePlaybackSession.run(playbackSessionId);
+    return { changes: result.changes };
+  }
+
+  function clearAllPlaybackSessions() {
+    db.exec('BEGIN');
+    try {
+      statements.deleteAllPlaybackSessionEvents.run();
+      const result = statements.deleteAllPlaybackSessions.run();
+      db.exec('COMMIT');
+      return { deleted: result.changes };
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  function prunePlaybackSessionsOlderThan(days) {
+    const parsed = Number(days);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error('days must be a positive number');
+    }
+    const cutoff = new Date(Date.now() - parsed * 86400 * 1000).toISOString();
+    db.exec('BEGIN');
+    try {
+      const sessions = statements.deletePlaybackSessionsOlderThan.run(cutoff);
+      const events = statements.deleteEventsOlderThan.run(cutoff);
+      db.exec('COMMIT');
+      return { deleted: sessions.changes, eventsDeleted: events.changes, cutoff };
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  function pruneDeviceLogsOlderThan(days) {
+    const parsed = Number(days);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error('days must be a positive number');
+    }
+    const cutoff = new Date(Date.now() - parsed * 86400 * 1000).toISOString();
+    db.exec('BEGIN');
+    try {
+      const result = statements.deleteDeviceLogsOlderThan.run(cutoff);
+      statements.refreshDeviceEntryCounts.run();
+      db.exec('COMMIT');
+      return { deleted: result.changes, cutoff };
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  function getDatabaseStats() {
+    let fileSizeBytes = 0;
+    try {
+      fileSizeBytes = fs.statSync(dbFile).size;
+    } catch (_) {}
+    const counts = {
+      playbackSessions: db.prepare('SELECT COUNT(*) AS c FROM playback_sessions').get().c || 0,
+      playbackSessionEvents: db.prepare('SELECT COUNT(*) AS c FROM playback_session_events').get().c || 0,
+      deviceLogs: db.prepare('SELECT COUNT(*) AS c FROM device_logs').get().c || 0,
+      devices: db.prepare('SELECT COUNT(*) AS c FROM devices').get().c || 0,
+      mediaItemMetadata: db.prepare('SELECT COUNT(*) AS c FROM media_item_metadata').get().c || 0,
+      events: db.prepare('SELECT COUNT(*) AS c FROM events').get().c || 0
+    };
+    const oldestPlaybackAt = db.prepare('SELECT MIN(COALESCE(last_seen_at, started_at)) AS ts FROM playback_sessions').get().ts || null;
+    const oldestDeviceLogAt = db.prepare('SELECT MIN(received_at) AS ts FROM device_logs').get().ts || null;
+    return {
+      fileSizeBytes,
+      counts,
+      oldestPlaybackAt,
+      oldestDeviceLogAt
+    };
+  }
+
+  function vacuumDatabase() {
+    db.exec('VACUUM');
   }
 
   function upsertDeviceLogs(payload, req) {
@@ -1119,7 +1305,7 @@ function createStorage(options) {
   }
 
   function getTopPlaybackLibraries(limit = 25, options = {}) {
-    const whereClause = buildAnalyticsRangeWhereClause(options, 'WHERE (library_id IS NOT NULL OR library_name IS NOT NULL)');
+    const whereClause = buildAnalyticsRangeWhereClause(options, "WHERE library_name IS NOT NULL AND TRIM(library_name) <> ''");
     return db.prepare(`
       SELECT
         library_id AS libraryId,

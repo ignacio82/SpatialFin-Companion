@@ -284,6 +284,9 @@ function isPathWithinExport(requestedPath, exportPath) {
   const requested = normalizeNfsExportPath(requestedPath, { allowRoot: true });
   const exported = normalizeNfsExportPath(exportPath, { allowRoot: true });
   if (!requested || !exported) return false;
+  // Reject traversal segments to keep path semantics well-defined for clients
+  // (SMB/NFS servers vary in whether they collapse '..').
+  if (requested.split('/').some((segment) => segment === '..')) return false;
   if (exported === '/') return requested.startsWith('/');
   return requested === exported || requested.startsWith(`${exported}/`);
 }
