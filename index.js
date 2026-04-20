@@ -19,6 +19,7 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 const { DEFAULT_PREFERENCES } = require('./default-preferences');
 const { createStorage } = require('./storage');
+const updater = require('./updater');
 const rateLimit = require('express-rate-limit');
 const fs = require('fs');
 const path = require('path');
@@ -2702,6 +2703,7 @@ backupDatabase();
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`SpatialFin Companion on port ${PORT}`);
+  updater.start();
 });
 
 wss = new WebSocketServer({ server });
