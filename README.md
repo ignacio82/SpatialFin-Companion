@@ -51,6 +51,27 @@ The dashboard is then available at:
 http://<your-server-ip>:1982
 ```
 
+### Automatic updates
+
+Once the container is running, the companion keeps itself up to date. You do
+not need to rerun `docker compose up -d --build` to pick up new releases.
+
+- On every container start, the entrypoint fetches tags from GitHub and checks
+  out the newest `v*` release before launching the server. Dependencies are
+  reinstalled automatically when `package-lock.json` changes.
+- Once a day, the running process checks the GitHub `releases/latest` endpoint.
+  If a newer release has been published, the process exits and Docker's
+  `restart: unless-stopped` policy restarts the container onto the new version.
+- Your `./data/` volume (SQLite DB, backups, uploaded logs) is preserved
+  across updates.
+
+To pin to the image you built and skip auto-updates, set
+`COMPANION_AUTO_UPDATE=false` in the environment.
+
+> If you are upgrading from a version before 2.0.0, run `git pull && docker
+> compose up -d --build` once to install the auto-updater. Every release after
+> that will roll out automatically.
+
 ### Optional admin password
 
 Set `COMPANION_ADMIN_PASSWORD` before starting the container if you want the dashboard locked behind a login screen.
