@@ -36,6 +36,11 @@ SpatialFin Companion is the local management and analytics hub for the **Spatial
   - Persist enriched Jellyfin item metadata for analytics rows.
   - Show posters, overview text, runtime, year, ratings, genres, and series context in item/session drilldowns.
 - Progressive Web App support for installing the dashboard on desktop or mobile.
+- Web search sidecar for the SpatialFin voice AI:
+  - Bundled SearXNG container (pinned tag) bound to loopback only.
+  - `GET /api/v1/search?q=...` proxy behind the existing setup-token auth.
+  - `/api/meta` advertises `capabilities.web_search=true` so paired headsets auto-enable the feature.
+  - Override with `COMPANION_SEARXNG_URL` to target an external SearXNG instance, or unset it to disable web search entirely.
 
 ## Docker Deployment
 

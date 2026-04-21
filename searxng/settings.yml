@@ -1,0 +1,46 @@
+# SpatialFin-Companion SearXNG settings.
+#
+# This file overrides SearXNG's defaults (which ship with `search.formats: [html]`
+# only — the JSON format required by our /api/search proxy is off unless enabled
+# here). Only the handful of values we actually care about are overridden;
+# `use_default_settings: true` keeps upstream's engine list, categories, etc.
+#
+# Access model: SearXNG binds to 127.0.0.1 only (see docker-compose.yaml), so
+# nothing on the LAN can reach it directly. The companion's /api/search endpoint
+# is the only front door and brokers auth via the setup-token the headset
+# already uses. Don't expose SearXNG on a routable interface without adding
+# independent auth — it would otherwise be an open metasearch relay.
+#
+# The `$SEARXNG_SECRET` placeholder is substituted by the searxng/searxng
+# image's entrypoint using the env var of the same name (set in
+# docker-compose.yaml). Only secures pagination/CSRF tokens — LAN-only +
+# loopback-bound service, so the default bundled value is acceptable, but you
+# can override it via `export SEARXNG_SECRET=...` before `docker compose up`.
+
+use_default_settings: true
+
+general:
+  instance_name: "spatialfin-companion"
+  # Don't advertise on public SearXNG directories — this is a private instance.
+  privacypolicy_url: false
+  donation_url: false
+  contact_url: false
+
+server:
+  secret_key: "$SEARXNG_SECRET"
+  # Bind is set via SEARXNG_BIND_ADDRESS in compose.
+  limiter: false
+  # No public bot-protection cookies needed on a loopback service.
+  image_proxy: false
+
+search:
+  # Enable JSON output so the companion proxy can consume structured results.
+  formats:
+    - html
+    - json
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "auto"
+
+ui:
+  static_use_hash: true

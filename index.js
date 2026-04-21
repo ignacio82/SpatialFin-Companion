@@ -51,6 +51,10 @@ const {
   normalizeTvReceiverInput,
   buildTvPairingEnvelope
 } = require('./tv-pairing');
+const { performSearch: performWebSearch } = require('./web-search');
+
+const SEARXNG_URL = (process.env.COMPANION_SEARXNG_URL || '').trim();
+const WEB_SEARCH_ENABLED = SEARXNG_URL.length > 0;
 
 const app = express();
 const PORT = Number(process.env.PORT) || 1982;
@@ -2595,7 +2599,15 @@ const APP_VERSION = (() => {
 })();
 
 app.get('/api/meta', (req, res) => {
-  res.json({ version: APP_VERSION });
+  res.json({
+    version: APP_VERSION,
+    capabilities: {
+      // True when a local SearXNG sidecar (or a user-provided SearXNG URL) is
+      // reachable via the companion. Lets the headset hide the web_search tool
+      // action when nothing is configured instead of probing on every query.
+      web_search: WEB_SEARCH_ENABLED,
+    },
+  });
 });
 
 app.use('/api/admin', adminRouter);
@@ -2638,6 +2650,42 @@ app.post('/api/v1/device-logs', (req, res) => {
         client.send(msg);
       }
     });
+  }
+});
+
+// Web search proxy. Fronts the local SearXNG sidecar (or a user-overridden
+// URL) and returns a trimmed JSON shape. The headset never hits SearXNG
+// directly — SearXNG is bound to loopback and this endpoint is the only way in.
+//
+// Rate-limited independently from the admin login limiter: per-IP, a reasonable
+// burst for conversational AI (a handful of queries in flight per turn).
+const searchLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many search requests' },
+});
+
+app.get('/api/v1/search', searchLimiter, async (req, res) => {
+  const token = req.headers['x-setup-token'];
+  if (token !== appConfig.setup_token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  if (!WEB_SEARCH_ENABLED) {
+    return res.status(503).json({ error: 'Web search is not configured' });
+  }
+  const query = typeof req.query.q === 'string' ? req.query.q : '';
+  try {
+    const payload = await performWebSearch({ query, searxngUrl: SEARXNG_URL });
+    storage.recordEvent('web_search', req, {
+      queryLen: query.length,
+      resultCount: payload.results.length,
+    });
+    res.json(payload);
+  } catch (err) {
+    const status = typeof err.status === 'number' ? err.status : 500;
+    res.status(status).json({ error: err.message || 'Search failed' });
   }
 });
 

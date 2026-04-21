@@ -7,6 +7,54 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=Etc/UTC
+      # Set to `false` to develop locally without entrypoint.sh rewriting /app
+      # to the latest tagged release. Default is the released-update behavior
+      # described in AGENTS.md.
+      - COMPANION_AUTO_UPDATE=${COMPANION_AUTO_UPDATE:-true}
+      # Point the companion at the local SearXNG sidecar. Override with
+      # COMPANION_SEARXNG_URL to disable or target an external instance.
+      - COMPANION_SEARXNG_URL=http://127.0.0.1:8898/search
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    depends_on:
+      - spatialfin-searxng
+
+  # SearXNG metasearch aggregator. Bound to loopback only (host networking) so
+  # nothing on the LAN can hit it directly — the companion is the single front
+  # door and brokers auth via the existing setup-token. Pinned to a specific
+  # tag: `:latest` would roll forward silently when upstream changes break a
+  # search engine, and the companion's 24h self-update loop would ship the
+  # breakage to every user overnight. Bump the tag deliberately.
+  spatialfin-searxng:
+    image: searxng/searxng:2026.4.17-e8299a4c3
+    container_name: spatialfin-searxng
+    network_mode: host
+    environment:
+      # searxng/searxng uses granian; the entrypoint aliases SEARXNG_PORT ->
+      # GRANIAN_PORT. Explicitly overriding GRANIAN_HOST is required because
+      # the image defaults it to `::` (all IPv6 interfaces), which under
+      # host networking would expose SearXNG on the LAN. Loopback-only is
+      # the whole trust model here.
+      - GRANIAN_HOST=127.0.0.1
+      - SEARXNG_PORT=8898
+      - SEARXNG_BASE_URL=http://127.0.0.1:8898/
+      - INSTANCE_NAME=spatialfin-searxng
+      # Pagination/CSRF secret — loopback + companion-gated service, so the
+      # default is acceptable. Override with `export SEARXNG_SECRET=...` before
+      # `docker compose up` if you prefer a rotated value.
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-spatialfin-companion-default-searxng-secret}
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
