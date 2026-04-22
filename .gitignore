@@ -3,6 +3,10 @@
 /data/
 .env
 .env.*
+# Docker Compose override is loaded automatically when present; reserve for
+# dev-only bind-mounts and env tweaks that should not ship to end users.
+docker-compose.override.yml
+docker-compose.override.yaml
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
