@@ -741,22 +741,39 @@ const JELLYFIN_METADATA_CACHE_TTL_MS = Math.max(
   60_000,
   Number(process.env.COMPANION_ITEM_METADATA_TTL_MS) || 30 * 60_000
 );
+// Shorter TTL for "this item does not exist / is inaccessible" entries so a
+// later re-add or permission change isn't permanently hidden. Long enough to
+// suppress the hot-loop of retries against deleted items observed in the
+// analytics path (see enrichSessionsWithItemMetadata) — an uncached 404 spams
+// a log line per session-event, pushes real work off the event loop, and was
+// implicated in a WS-upgrade hang after long container runtimes.
+const JELLYFIN_METADATA_NEGATIVE_TTL_MS = Math.max(
+  30_000,
+  Number(process.env.COMPANION_ITEM_METADATA_NEGATIVE_TTL_MS) || 5 * 60_000
+);
 const JELLYFIN_METADATA_CACHE_MAX = 2000;
-const jellyfinItemMetadataCache = new Map(); // key -> { value, expiresAt }
+const jellyfinItemMetadataCache = new Map(); // key -> { value, expiresAt, negative? }
 
 function metadataCacheKey(serverId, itemId) {
   return `${serverId || 'server'}:${itemId}`;
 }
 
+/**
+ * Returns `{ hit: true, value }` for a positive cache hit, `{ hit: true,
+ * value: null, negative: true }` for a cached "known missing" entry, and
+ * `{ hit: false }` for a miss. Keeping negative/positive/miss distinguishable
+ * lets callers skip the Jellyfin round trip for known-missing items without
+ * losing the ability to log the first failure.
+ */
 function getCachedItemMetadata(serverConfig, itemId) {
   const key = metadataCacheKey(serverConfig && serverConfig.id, itemId);
   const entry = jellyfinItemMetadataCache.get(key);
-  if (!entry) return null;
+  if (!entry) return { hit: false };
   if (entry.expiresAt <= Date.now()) {
     jellyfinItemMetadataCache.delete(key);
-    return null;
+    return { hit: false };
   }
-  return entry.value;
+  return { hit: true, value: entry.value, negative: entry.negative === true };
 }
 
 function setCachedItemMetadata(serverConfig, itemId, value) {
@@ -772,18 +789,42 @@ function setCachedItemMetadata(serverConfig, itemId, value) {
   });
 }
 
+function setCachedItemMetadataNegative(serverConfig, itemId) {
+  const key = metadataCacheKey(serverConfig && serverConfig.id, itemId);
+  if (jellyfinItemMetadataCache.size >= JELLYFIN_METADATA_CACHE_MAX) {
+    const firstKey = jellyfinItemMetadataCache.keys().next().value;
+    if (firstKey) jellyfinItemMetadataCache.delete(firstKey);
+  }
+  jellyfinItemMetadataCache.set(key, {
+    value: null,
+    negative: true,
+    expiresAt: Date.now() + JELLYFIN_METADATA_NEGATIVE_TTL_MS
+  });
+}
+
 async function fetchJellyfinItemMetadata(serverConfig, userConfig, itemId) {
   const baseUrl = String((serverConfig.addresses && serverConfig.addresses[0]) || '').replace(/\/+$/, '');
   const token = userConfig && userConfig.access_token;
   if (!baseUrl || !token || !itemId) return null;
   const cached = getCachedItemMetadata(serverConfig, itemId);
-  if (cached) return cached;
+  if (cached.hit) {
+    // Known-missing entries short-circuit the round trip. Their TTL is shorter
+    // than positive entries so a re-added item eventually re-fetches.
+    return cached.value;
+  }
   const encodedItemId = encodeURIComponent(itemId);
   const userId = userConfig.id ? encodeURIComponent(userConfig.id) : null;
   const itemPath = userId ? `/Users/${userId}/Items/${encodedItemId}` : `/Items/${encodedItemId}`;
   const query = 'Fields=Overview,PrimaryImageAspectRatio,PremiereDate,ProductionYear,CommunityRating,OfficialRating,Genres,RunTimeTicks,SeriesName,SeasonName,ImageTags,BackdropImageTags,ImageBlurHashes';
   const result = await httpGet(`${baseUrl}${itemPath}?${query}`, buildJellyfinAuthHeaders(token), 10000);
   if (result.status !== 200 || !result.data || typeof result.data !== 'object') {
+    // Cache the miss so rapid analytics events don't re-hammer Jellyfin with
+    // the same 404. 401/403/410 follow the same pattern — the item is either
+    // gone or inaccessible, and retrying on every session event just floods
+    // the log and wastes outbound requests.
+    if ([404, 401, 403, 410].includes(result.status)) {
+      setCachedItemMetadataNegative(serverConfig, itemId);
+    }
     throw new Error(`Item fetch failed for ${serverConfig.name || baseUrl}: HTTP ${result.status}`);
   }
   const metadata = normalizeJellyfinItemMetadata(serverConfig, result.data);
@@ -801,6 +842,11 @@ async function enrichSessionsWithItemMetadata(serverConfig, userConfig, sessions
   });
   const entries = [];
   for (const itemId of unique.values()) {
+    // Skip known-missing items entirely. fetchJellyfinItemMetadata would also
+    // short-circuit via its own cache lookup, but checking here keeps the log
+    // path quiet — otherwise every analytics sync prints one warn per dead
+    // itemId until the negative TTL expires.
+    if (getCachedItemMetadata(serverConfig, itemId).negative) continue;
     try {
       const metadata = await fetchJellyfinItemMetadata(serverConfig, userConfig, itemId);
       if (metadata) entries.push(metadata);
