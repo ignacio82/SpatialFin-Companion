@@ -12,6 +12,13 @@ const KEYS = {
   attempts: 'pref_app_lock_max_attempts',
 };
 
+const MODE_OPTIONS = [
+  { value: '',          label: 'Inherit global' },
+  { value: 'off',       label: 'Off' },
+  { value: 'biometric', label: 'Biometric' },
+  { value: 'pin',       label: 'SpatialFin PIN' },
+];
+
 export default function Security({ config, reloadConfig, onToast }) {
   const gp = config?.globalPreferences || {};
   const [mode, setMode] = useState(gp[KEYS.mode] || '');
@@ -19,6 +26,7 @@ export default function Security({ config, reloadConfig, onToast }) {
   const [attempts, setAttempts] = useState(Number(gp[KEYS.attempts] || 1));
   const [devices, setDevices] = useState([]);
   const [busy, setBusy] = useState(false);
+  const [editingDevice, setEditingDevice] = useState(null);
 
   useEffect(() => {
     setMode(gp[KEYS.mode] || '');
@@ -53,6 +61,27 @@ export default function Security({ config, reloadConfig, onToast }) {
       await api.setConfig({ ...config, globalPreferences: nextPrefs });
       await reloadConfig?.();
       onToast?.('Security saved · pushing to devices', 'success');
+    } catch (e) { onToast?.('Save failed: ' + e.message, 'error'); }
+    finally { setBusy(false); }
+  }
+
+  async function saveDeviceOverride(deviceId, override) {
+    setBusy(true);
+    try {
+      if (!override.mode) {
+        await api.clearDevicePrefs(deviceId);
+        onToast?.('Override cleared · device now inherits global', 'success');
+      } else {
+        const body = { [KEYS.mode]: override.mode };
+        if (override.mode === 'pin') {
+          body[KEYS.wipe] = override.wipe ? 'true' : 'false';
+          body[KEYS.attempts] = String(Math.min(3, Math.max(1, Number(override.attempts) || 1)));
+        }
+        await api.setDevicePrefs(deviceId, body);
+        onToast?.('Override pushed to device', 'success');
+      }
+      await reloadConfig?.();
+      setEditingDevice(null);
     } catch (e) { onToast?.('Save failed: ' + e.message, 'error'); }
     finally { setBusy(false); }
   }
@@ -150,15 +179,17 @@ export default function Security({ config, reloadConfig, onToast }) {
             <thead>
               <tr>
                 <th>Device</th>
-                <th style={{ width: 130 }}>Effective Mode</th>
-                <th style={{ width: 130 }}>Override</th>
-                <th style={{ width: 150 }}>Last Sync</th>
+                <th style={{ width: 150 }}>Effective Mode</th>
+                <th style={{ width: 150 }}>Override</th>
+                <th style={{ width: 150 }}>Last Seen</th>
+                <th style={{ width: 90 }}/>
               </tr>
             </thead>
             <tbody>
               {devices.map((d) => {
                 const id = d.deviceId || d.id;
-                const override = devicePrefs[id]?.[KEYS.mode];
+                const overrides = devicePrefs[id] || {};
+                const overrideMode = overrides[KEYS.mode];
                 const eff = effectiveMode(id);
                 return (
                   <tr key={id}>
@@ -169,17 +200,28 @@ export default function Security({ config, reloadConfig, onToast }) {
                       </div>
                     </td>
                     <td>
-                      <span className={'chip ' + (eff === 'pin' ? 'warn' : eff === 'off' ? '' : 'teal')}>
+                      <span className={'chip ' + (eff === 'pin' ? 'warn' : eff === 'off' ? '' : eff === 'biometric' ? 'teal' : '')}>
                         {eff === 'off' ? 'Off' : eff === 'pin' ? 'SpatialFin PIN' : eff === 'biometric' ? 'Biometric' : 'Inherit'}
                       </span>
                     </td>
                     <td>
-                      {override
-                        ? <span className="chip warn"><span className="dot"/> Custom</span>
+                      {overrideMode
+                        ? <span className="chip warn"><span className="dot"/> Custom ({overrideMode})</span>
                         : <span className="muted">inherits global</span>}
                     </td>
                     <td className="muted tnum" style={{ fontSize: 11 }}>
                       {d.lastSeenAt ? ago(d.lastSeenAt) : '—'}
+                    </td>
+                    <td>
+                      <button className="btn ghost sm" onClick={() => setEditingDevice({
+                        deviceId: id,
+                        name: d.name || d.deviceName || id,
+                        mode: overrideMode || '',
+                        wipe: overrides[KEYS.wipe] === 'true',
+                        attempts: Number(overrides[KEYS.attempts] || 1),
+                      })}>
+                        Edit
+                      </button>
                     </td>
                   </tr>
                 );
@@ -187,6 +229,95 @@ export default function Security({ config, reloadConfig, onToast }) {
             </tbody>
           </table>
         )}
+      </div>
+
+      {editingDevice && (
+        <DeviceOverrideModal
+          state={editingDevice}
+          onChange={setEditingDevice}
+          onSave={() => saveDeviceOverride(editingDevice.deviceId, editingDevice)}
+          onClear={() => saveDeviceOverride(editingDevice.deviceId, { mode: '' })}
+          onClose={() => setEditingDevice(null)}
+          busy={busy}
+        />
+      )}
+    </div>
+  );
+}
+
+function DeviceOverrideModal({ state, onChange, onSave, onClear, onClose, busy }) {
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 80,
+        background: 'rgba(2, 6, 12, 0.72)',
+        backdropFilter: 'blur(10px)',
+        display: 'grid',
+        placeItems: 'center',
+      }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="card elev-3"
+        style={{ width: 480, maxWidth: 'calc(100vw - 32px)', padding: 20 }}
+      >
+        <div className="card-head">
+          <div className="titlewrap">
+            <span className="eyebrow">Override</span>
+            <span className="title">{state.name}</span>
+          </div>
+          <button className="btn ghost icon-only sm" onClick={onClose}>
+            <Icon name="close" size={12}/>
+          </button>
+        </div>
+        <div className="setting-row">
+          <div><div className="lbl">Mode</div></div>
+          <div className="ctl">
+            <Segmented
+              value={state.mode}
+              onChange={(v) => onChange({ ...state, mode: v })}
+              options={MODE_OPTIONS}
+            />
+          </div>
+        </div>
+        {state.mode === 'pin' && (
+          <>
+            <div className="setting-row">
+              <div><div className="lbl">Wipe on failed PIN</div></div>
+              <div className="ctl">
+                <Toggle on={state.wipe} onChange={(v) => onChange({ ...state, wipe: v })}/>
+              </div>
+            </div>
+            <div className="setting-row">
+              <div><div className="lbl">Max attempts (1–3)</div></div>
+              <div className="ctl">
+                <input
+                  className="input"
+                  type="number"
+                  min="1"
+                  max="3"
+                  value={state.attempts}
+                  onChange={(e) => onChange({ ...state, attempts: e.target.value })}
+                  style={{ width: 80 }}
+                />
+              </div>
+            </div>
+          </>
+        )}
+        <div className="row" style={{ justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+          {state.mode && (
+            <button className="btn danger" onClick={onClear} disabled={busy}>
+              Clear override
+            </button>
+          )}
+          <button className="btn" onClick={onClose}>Cancel</button>
+          <button className="btn primary" onClick={onSave} disabled={busy}>
+            <Icon name="check" size={13}/> {busy ? 'Pushing…' : 'Push to device'}
+          </button>
+        </div>
       </div>
     </div>
   );

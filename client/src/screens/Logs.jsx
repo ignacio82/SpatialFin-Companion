@@ -58,6 +58,35 @@ export default function Logs({ onToast }) {
     } catch (e) { onToast?.('Clear failed: ' + e.message, 'error'); }
   }
 
+  async function renameDevice() {
+    if (!active) return;
+    const id = active.deviceId || active.id;
+    const next = window.prompt('Rename device', active.name || active.deviceName || id);
+    if (next == null) return;
+    const trimmed = next.trim();
+    if (!trimmed || trimmed === (active.name || active.deviceName)) return;
+    try {
+      await api.patchDevice(id, { name: trimmed });
+      onToast?.('Device renamed', 'success');
+      const refreshed = { ...active, name: trimmed };
+      setActive(refreshed);
+      loadDevices();
+    } catch (e) { onToast?.('Rename failed: ' + e.message, 'error'); }
+  }
+
+  async function deleteDevice() {
+    if (!active) return;
+    const id = active.deviceId || active.id;
+    if (!confirm(`Delete device "${active.name || id}"? This removes its logs and identity from the companion.`)) return;
+    try {
+      await api.deleteDevice(id);
+      onToast?.('Device deleted', 'success');
+      setActive(null);
+      setLines([]);
+      loadDevices();
+    } catch (e) { onToast?.('Delete failed: ' + e.message, 'error'); }
+  }
+
   function copyVisible() {
     const text = filtered.map((l) => `${l.t || l.timestamp || ''}  ${l.lvl || l.level || ''}  ${l.src || l.source || ''}  ${l.msg || l.message || ''}`).join('\n');
     navigator.clipboard.writeText(text).then(() => onToast?.('Copied visible lines', 'success')).catch(() => onToast?.('Copy failed', 'error'));
@@ -164,15 +193,21 @@ export default function Logs({ onToast }) {
                   <span className="tnum">{lines.length.toLocaleString()}</span> lines loaded · streaming live
                 </div>
               </div>
-              <div className="row" style={{ gap: 8 }}>
+              <div className="row" style={{ gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                <button className="btn sm" onClick={renameDevice} disabled={!active} title="Rename device">
+                  <Icon name="settings" size={13}/> Rename
+                </button>
                 <button className="btn sm" onClick={copyVisible} disabled={!filtered.length}>
                   <Icon name="copy" size={13}/> Copy
                 </button>
                 <a className="btn sm" href={active ? api.deviceLogDownloadUrl(active.deviceId || active.id) : '#'} style={{ pointerEvents: active ? 'auto' : 'none', textDecoration: 'none' }}>
                   <Icon name="download" size={13}/> Download
                 </a>
-                <button className="btn sm danger" onClick={clearLogs} disabled={!active}>
-                  <Icon name="trash" size={13}/> Clear
+                <button className="btn sm danger" onClick={clearLogs} disabled={!active} title="Delete this device's logs">
+                  <Icon name="trash" size={13}/> Clear logs
+                </button>
+                <button className="btn sm danger" onClick={deleteDevice} disabled={!active} title="Forget the entire device">
+                  <Icon name="trash" size={13}/> Delete device
                 </button>
               </div>
             </div>

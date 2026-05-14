@@ -333,28 +333,7 @@ export default function Settings({ config, reloadConfig, onToast }) {
         </div>
       </div>
 
-      <div className="card">
-        <div className="card-head">
-          <div className="titlewrap">
-            <span className="eyebrow">Backup</span>
-            <span className="title">Config Snapshot</span>
-          </div>
-        </div>
-        <div className="row wrap" style={{ gap: 8 }}>
-          <a className="btn sm" href={api.exportConfigUrl()} style={{ textDecoration: 'none' }}>
-            <Icon name="download" size={13}/> Export config.json
-          </a>
-          <label className="btn sm" style={{ cursor: 'pointer' }}>
-            <Icon name="upload" size={13}/> Import config.json
-            <input
-              type="file"
-              accept="application/json,.json"
-              style={{ display: 'none' }}
-              onChange={(e) => importFile(e.target.files?.[0])}
-            />
-          </label>
-        </div>
-      </div>
+      <SnapshotsCard reloadConfig={reloadConfig} onToast={onToast} importFile={importFile}/>
 
       <div className="row" style={{ justifyContent: 'flex-end', gap: 8 }}>
         <button className="btn" disabled={!dirty} onClick={() => { setDraft({ ...(config?.globalPreferences || {}) }); setDirty(false); }}>
@@ -401,6 +380,97 @@ function NumberRow({ label, hint, prefKey, draft, onChange }) {
           onChange={(e) => onChange(prefKey, e.target.value)}
         />
       </div>
+    </div>
+  );
+}
+
+function SnapshotsCard({ reloadConfig, onToast, importFile }) {
+  const [snapshots, setSnapshots] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [open, setOpen] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const data = await api.listSnapshots();
+      setSnapshots(Array.isArray(data?.snapshots) ? data.snapshots : (Array.isArray(data) ? data : []));
+    } catch (e) {
+      onToast?.('Could not load snapshots: ' + e.message, 'error');
+    } finally { setLoading(false); }
+  }
+
+  useEffect(() => {
+    if (open) load();
+  }, [open]);
+
+  async function restore(id) {
+    if (!confirm('Restore this snapshot? The current config will be replaced (and itself snapshotted).')) return;
+    try {
+      await api.restoreSnapshot(id);
+      await reloadConfig?.();
+      onToast?.('Snapshot restored', 'success');
+    } catch (e) { onToast?.('Restore failed: ' + e.message, 'error'); }
+  }
+
+  return (
+    <div className="card">
+      <div className="card-head">
+        <div className="titlewrap">
+          <span className="eyebrow">Backup</span>
+          <span className="title">Config Snapshot &amp; History</span>
+        </div>
+        <div className="right">
+          <button className="btn ghost sm" onClick={() => setOpen((o) => !o)}>
+            {open ? 'Hide history' : 'Show history'}
+          </button>
+        </div>
+      </div>
+      <div className="row wrap" style={{ gap: 8 }}>
+        <a className="btn sm" href={api.exportConfigUrl()} style={{ textDecoration: 'none' }}>
+          <Icon name="download" size={13}/> Export config.json
+        </a>
+        <label className="btn sm" style={{ cursor: 'pointer' }}>
+          <Icon name="upload" size={13}/> Import config.json
+          <input
+            type="file"
+            accept="application/json,.json"
+            style={{ display: 'none' }}
+            onChange={(e) => importFile(e.target.files?.[0])}
+          />
+        </label>
+      </div>
+      {open && (
+        <div style={{ marginTop: 14 }}>
+          {loading ? (
+            <div className="empty">Loading snapshots…</div>
+          ) : snapshots.length === 0 ? (
+            <div className="empty">No snapshots yet. Saving the config creates one automatically.</div>
+          ) : (
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th style={{ width: 200 }}>Taken</th>
+                  <th>Reason</th>
+                  <th style={{ width: 110 }}/>
+                </tr>
+              </thead>
+              <tbody>
+                {snapshots.slice(0, 25).map((s) => (
+                  <tr key={s.id}>
+                    <td className="mono muted" style={{ fontSize: 11 }}>
+                      {(() => { const t = s.createdAt || s.created_at; return t ? new Date(t).toLocaleString() : '—'; })()}
+                    </td>
+                    <td className="muted">{s.reason || 'config-update'}</td>
+                    <td>
+                      <button className="btn ghost sm" onClick={() => restore(s.id)}>Restore</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
     </div>
   );
 }

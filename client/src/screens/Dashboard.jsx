@@ -3,12 +3,16 @@ import Icon from '../components/Icon.jsx';
 import StatTile from '../components/StatTile.jsx';
 import QrPaper from '../components/QrPaper.jsx';
 import Sparkline from '../components/Sparkline.jsx';
+import Modal from '../components/Modal.jsx';
+import TvPairingModal from '../components/TvPairingModal.jsx';
 import { api } from '../api.js';
 import { useWebSocketEvent } from '../ws.js';
 import { fmtBytes, fmtMinutes, ago, shortAgo, fmtTime } from '../format.js';
 
 export default function Dashboard({ config, version, onNavigate, onToast }) {
   const [tokenVisible, setTokenVisible] = useState(false);
+  const [qrFullscreen, setQrFullscreen] = useState(false);
+  const [tvPairOpen, setTvPairOpen] = useState(false);
   const [qr, setQr] = useState(null);
   const [overview, setOverview] = useState(null);
   const [trend, setTrend] = useState([]);
@@ -93,15 +97,7 @@ export default function Dashboard({ config, version, onNavigate, onToast }) {
 
       {/* ── Hero ────────────────────────────────────────────────────────── */}
       <div className="hero">
-        <div
-          className="hero-grid"
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'minmax(0, 1fr) 260px minmax(0, 1fr)',
-            gap: 28,
-            alignItems: 'center',
-          }}
-        >
+        <div className="hero-grid">
           {/* Left — status, env */}
           <div className="col" style={{ gap: 14, position: 'relative', zIndex: 1 }}>
             <div className="eyebrow">Companion Status</div>
@@ -177,6 +173,9 @@ export default function Dashboard({ config, version, onNavigate, onToast }) {
               <span className="chip teal uc">
                 <span className="dot"/> Scanning Open
               </span>
+              <button className="btn sm ghost" onClick={() => setQrFullscreen(true)} title="Fullscreen QR">
+                <Icon name="expand" size={13}/> Fullscreen
+              </button>
             </div>
             <div
               className="mono"
@@ -200,15 +199,15 @@ export default function Dashboard({ config, version, onNavigate, onToast }) {
               Open SpatialFin on a headset and scan the code, or pair a Google TV by code from this companion.
             </div>
             <div className="col" style={{ gap: 8 }}>
-              <button className="btn primary" onClick={() => onNavigate?.('servers')}>
-                <Icon name="headset" size={14}/> XR Headset
+              <button className="btn primary" onClick={() => setQrFullscreen(true)}>
+                <Icon name="headset" size={14}/> XR Headset (show QR)
               </button>
-              <div className="row" style={{ gap: 8 }}>
-                <button className="btn" style={{ flex: 1 }} onClick={() => onNavigate?.('servers')}>
-                  <Icon name="tv" size={14}/> TV Pairing
+              <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                <button className="btn" style={{ flex: 1, minWidth: 120 }} onClick={() => setTvPairOpen(true)}>
+                  <Icon name="tv" size={14}/> Pair TV
                 </button>
-                <button className="btn" style={{ flex: 1 }} onClick={() => onNavigate?.('settings')}>
-                  <Icon name="settings" size={14}/> Settings
+                <button className="btn" style={{ flex: 1, minWidth: 120 }} onClick={() => onNavigate?.('servers')}>
+                  <Icon name="server" size={14}/> Servers
                 </button>
               </div>
             </div>
@@ -447,6 +446,34 @@ export default function Dashboard({ config, version, onNavigate, onToast }) {
           </div>
         </div>
       </div>
+
+      {qrFullscreen && (
+        <Modal
+          title="Scan from a headset"
+          eyebrow="Pairing"
+          width={520}
+          onClose={() => setQrFullscreen(false)}
+        >
+          <div style={{ display: 'grid', placeItems: 'center', gap: 14 }}>
+            <div className="qr-shell" style={{ width: 340, height: 340 }}>
+              <QrPaper dataUrl={qr?.qr || qr?.dataUrl}/>
+            </div>
+            <div className="mono" style={{ fontSize: 11, color: 'var(--t-3)', textAlign: 'center', wordBreak: 'break-all' }}>
+              {qr?.payload}
+            </div>
+            <div className="row" style={{ gap: 8 }}>
+              <button className="btn" onClick={() => setQrFullscreen(false)}>Close</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {tvPairOpen && (
+        <TvPairingModal
+          onClose={() => setTvPairOpen(false)}
+          onToast={onToast}
+        />
+      )}
 
       {/* ── Trend strip (compact) ───────────────────────────────────────── */}
       <div className="card">

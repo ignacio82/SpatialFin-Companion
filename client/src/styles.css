@@ -401,6 +401,21 @@ a { color: inherit; text-decoration: none; }
 }
 .topbar .actions {
   display: flex; gap: 8px; align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+@media (max-width: 720px) {
+  .topbar {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .topbar h1 { font-size: 18px; }
+  .topbar .sub { font-size: 11.5px; }
+  .topbar .actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
 }
 .topbar .actions .live {
   display: flex; align-items: center; gap: 8px;
@@ -434,6 +449,20 @@ a { color: inherit; text-decoration: none; }
   box-shadow: var(--elev-1);
   backdrop-filter: blur(18px) saturate(140%);
   -webkit-backdrop-filter: blur(18px) saturate(140%);
+  min-width: 0;
+}
+.card-head {
+  flex-wrap: wrap;
+}
+.card-head .right {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+/* Tables can overflow on mobile — let the card content scroll horizontally rather than
+   forcing the whole viewport to. */
+@media (max-width: 720px) {
+  .card { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .tbl  { min-width: 520px; }
 }
 .card.flat {
   background: rgba(10, 16, 24, 0.55);
@@ -722,7 +751,18 @@ a { color: inherit; text-decoration: none; }
   .grid.cols-4, .grid.cols-5, .grid.cols-6 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 720px) {
-  .grid.cols-2, .grid.cols-3, .grid.cols-4 { grid-template-columns: 1fr; }
+  .grid.cols-2, .grid.cols-3, .grid.cols-4, .grid.cols-5, .grid.cols-6 { grid-template-columns: 1fr; }
+}
+/* Two-up Dashboard "sync history + DB" and Analytics "sockets + servers" splits should also stack on mobile. */
+@media (max-width: 960px) {
+  .grid[style*="minmax(0, 1.6fr)"],
+  .grid[style*="minmax(0, 1.4fr)"] {
+    grid-template-columns: 1fr !important;
+  }
+  /* Side-by-side session list + detail in Analytics — let detail flow below the list. */
+  .sessions-grid {
+    grid-template-columns: 1fr !important;
+  }
 }
 
 /* ── Stat tiles ─────────────────────────────────────────────────────────── */
@@ -778,6 +818,25 @@ a { color: inherit; text-decoration: none; }
 }
 
 /* ── Hero (Dashboard) ───────────────────────────────────────────────────── */
+.hero-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px minmax(0, 1fr);
+  gap: 28px;
+  align-items: center;
+}
+@media (max-width: 960px) {
+  .hero-grid {
+    grid-template-columns: 1fr;
+    gap: 22px;
+    justify-items: center;
+    text-align: left;
+  }
+  .hero-grid > * {
+    width: 100%;
+    max-width: 420px;
+  }
+}
+
 .hero {
   position: relative;
   border-radius: var(--r-xl);

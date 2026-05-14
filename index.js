@@ -49,7 +49,8 @@ const {
   buildTvReceiverUrl,
   buildTvInfoUrl,
   normalizeTvReceiverInput,
-  buildTvPairingEnvelope
+  buildTvPairingEnvelope,
+  TV_PAIRING_PORT
 } = require('./tv-pairing');
 const { performSearch: performWebSearch } = require('./web-search');
 
