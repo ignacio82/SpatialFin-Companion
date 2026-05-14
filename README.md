@@ -210,12 +210,33 @@ Notes:
 
 ## Development
 
-Install dependencies and run the app directly:
+The dashboard is a React + Vite single-page app under `client/`. The built
+output is committed to `public/` so the auto-update loop never has to run
+Vite — every release just `git checkout`s and `npm ci --omit=dev`s.
+
+Install dependencies and run the API server:
 
 ```bash
 npm install
 node index.js
 ```
+
+The dashboard is served from `public/` as static files at
+`http://localhost:1982/`.
+
+### Working on the dashboard
+
+```bash
+# Live-reloading Vite dev server at http://localhost:5173,
+# /api/* proxied to localhost:1982.
+npm run dev
+
+# Produce the committed build in public/.
+npm run build
+```
+
+Always run `npm run build` and commit the resulting `public/` before tagging
+a release — that's what users will actually load.
 
 ## Related Project
 

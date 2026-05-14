@@ -30,7 +30,9 @@ release reaches users within ~24 hours.** Treat releases as production.
 | `entrypoint.sh` | Pulls the newest release tag on boot, runs `npm ci` when `package-lock.json` changes, then execs node |
 | `Dockerfile` | Clones the repo + checks out latest release tag at build time |
 | `docker-compose.yaml` | Default deployment (host network, `restart: unless-stopped`) |
-| `public/` | Dashboard UI (vanilla HTML/JS/CSS) |
+| `client/` | Dashboard source — React + Vite. `client/src/` for components/screens, `client/public/` for static assets. |
+| `public/` | **Build output**, served by Express. Produced by `npm run build` from `client/`. Committed to git so the auto-update loop never has to run Vite. |
+| `vite.config.js` | Vite config — outputs to `public/`, proxies `/api` to the API server in dev. |
 | `test/` | Node test runner specs (`npm test`) |
 | `data/` | User state — SQLite DB, backups, uploaded logs. Do not touch at runtime. |
 
@@ -73,11 +75,14 @@ turn.
 ### Release checklist (only when user approves)
 
 1. Make sure `master` has the change and tests pass (`npm test`).
-2. Bump `version` in `package.json` following semver.
-3. Commit: `git commit -am "Release vX.Y.Z"` (use the exact version).
-4. Tag: `git tag -a vX.Y.Z -m "vX.Y.Z"`.
-5. Push: `git push origin master && git push origin vX.Y.Z`.
-6. Publish the GitHub release — this is what `releases/latest` returns:
+2. If the dashboard changed, **rebuild it**: `npm run build` and commit the
+   resulting `public/` along with the source. Forgetting this step ships
+   stale UI to every install.
+3. Bump `version` in `package.json` following semver.
+4. Commit: `git commit -am "Release vX.Y.Z"` (use the exact version).
+5. Tag: `git tag -a vX.Y.Z -m "vX.Y.Z"`.
+6. Push: `git push origin master && git push origin vX.Y.Z`.
+7. Publish the GitHub release — this is what `releases/latest` returns:
    ```sh
    gh release create vX.Y.Z --title "vX.Y.Z" --notes "<changelog>"
    ```
@@ -105,6 +110,17 @@ node index.js
 - To develop without the runtime updater tripping you up, run with
   `COMPANION_AUTO_UPDATE=false`.
 - Dashboard is at `http://localhost:1982`.
+
+### Dashboard build
+
+The dashboard is React + Vite. Source lives in `client/`. The build output
+lives in `public/` and is committed to git.
+
+- `npm run dev` — Vite dev server at <http://localhost:5173> with `/api/*` proxied to `localhost:1982`.
+- `npm run build` — produces `public/index.html` and `public/assets/*`.
+
+**You must rebuild before tagging a release.** End users only ever load
+`public/` — if it's stale, your code changes never reach them.
 
 ## Environment variables
 
@@ -140,6 +156,8 @@ node index.js
 ## Pre-release checklist
 
 - [ ] `npm test` passes.
+- [ ] If the dashboard changed: `npm run build` succeeds and the new
+      `public/index.html` + `public/assets/` are committed.
 - [ ] `docker compose build` succeeds from a clean state.
 - [ ] A fresh container boots cleanly against the new tag (no schema errors,
       no missing files, dashboard loads).
