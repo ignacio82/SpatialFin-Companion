@@ -1723,6 +1723,21 @@ function validateConfigPatch(body) {
       }
       if (server.users !== undefined && !Array.isArray(server.users)) {
         errors.push(`servers[${idx}].users must be an array.`);
+      } else if (Array.isArray(server.users)) {
+        server.users.forEach((user, uIdx) => {
+          if (!user || typeof user !== 'object' || Array.isArray(user)) return;
+          if (user.musicAssistant !== undefined && user.musicAssistant !== null) {
+            const ma = user.musicAssistant;
+            if (typeof ma !== 'object' || Array.isArray(ma) || typeof ma.url !== 'string') {
+              errors.push(`servers[${idx}].users[${uIdx}].musicAssistant must be an object with a string url.`);
+            }
+          }
+          if (user.plugins !== undefined && user.plugins !== null) {
+            if (!Array.isArray(user.plugins) || user.plugins.some((p) => typeof p !== 'string')) {
+              errors.push(`servers[${idx}].users[${uIdx}].plugins must be an array of manifest URL strings.`);
+            }
+          }
+        });
       }
       if (server.addresses !== undefined && !Array.isArray(server.addresses)) {
         errors.push(`servers[${idx}].addresses must be an array.`);
@@ -2258,6 +2273,12 @@ function redactConfigForExport(config) {
         server.users.forEach((user) => {
           if (user && user.access_token) user.access_token = SECRET_PLACEHOLDER;
           if (user && user.password) delete user.password;
+          if (user && user.musicAssistant && user.musicAssistant.token) {
+            user.musicAssistant.token = SECRET_PLACEHOLDER;
+          }
+          if (user && user.musicAssistant && user.musicAssistant.password) {
+            user.musicAssistant.password = SECRET_PLACEHOLDER;
+          }
         });
       }
     });
@@ -2297,9 +2318,15 @@ function restoreRedactedSecrets(imported, current) {
       const existingUsers = new Map((existing.users || []).map((u) => [u.username || u.name, u]));
       server.users.forEach((user) => {
         if (!user) return;
+        const prev = existingUsers.get(user.username || user.name);
         if (user.access_token === SECRET_PLACEHOLDER) {
-          const prev = existingUsers.get(user.username || user.name);
           user.access_token = (prev && prev.access_token) || '';
+        }
+        if (user.musicAssistant && user.musicAssistant.token === SECRET_PLACEHOLDER) {
+          user.musicAssistant.token = (prev && prev.musicAssistant && prev.musicAssistant.token) || '';
+        }
+        if (user.musicAssistant && user.musicAssistant.password === SECRET_PLACEHOLDER) {
+          user.musicAssistant.password = (prev && prev.musicAssistant && prev.musicAssistant.password) || '';
         }
       });
     });

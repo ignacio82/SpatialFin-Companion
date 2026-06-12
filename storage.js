@@ -742,6 +742,51 @@ function createStorage(options) {
     });
   }
 
+  // Per-user Music Assistant config + universal-plugin manifest URLs ride on the
+  // server's users[] (the same container that already carries per-user
+  // preferences). Coerce them to clean shapes while preserving everything else.
+  function normalizeServers(rawServers) {
+    if (!Array.isArray(rawServers)) return [];
+    return rawServers.map((server) => {
+      if (!server || typeof server !== 'object' || Array.isArray(server)) return server;
+      if (!Array.isArray(server.users)) return server;
+      return {
+        ...server,
+        users: server.users.map((user) => {
+          if (!user || typeof user !== 'object' || Array.isArray(user)) return user;
+          const next = { ...user };
+          // musicAssistant: { url, token?, username? } — drop unless url is set.
+          const ma = user.musicAssistant;
+          if (ma && typeof ma === 'object' && !Array.isArray(ma) && typeof ma.url === 'string' && ma.url.trim()) {
+            const cleanMa = { url: ma.url.trim() };
+            if (typeof ma.token === 'string' && ma.token) cleanMa.token = ma.token;
+            if (typeof ma.username === 'string' && ma.username) cleanMa.username = ma.username;
+            if (typeof ma.password === 'string' && ma.password) cleanMa.password = ma.password;
+            next.musicAssistant = cleanMa;
+          } else {
+            delete next.musicAssistant;
+          }
+          // plugins: deduped list of manifest-URL strings.
+          if (Array.isArray(user.plugins)) {
+            const seen = new Set();
+            const plugins = [];
+            for (const entry of user.plugins) {
+              if (typeof entry !== 'string') continue;
+              const url = entry.trim();
+              if (!url || seen.has(url)) continue;
+              seen.add(url);
+              plugins.push(url);
+            }
+            next.plugins = plugins;
+          } else {
+            delete next.plugins;
+          }
+          return next;
+        }),
+      };
+    });
+  }
+
   function normalizeConfig(input) {
     const config = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
     // devicePreferences: { [deviceId]: { [prefKey]: stringValue | null } }
@@ -769,7 +814,7 @@ function createStorage(options) {
         ...(config.globalPreferences && typeof config.globalPreferences === 'object' ? config.globalPreferences : {})
       },
       devicePreferences,
-      servers: Array.isArray(config.servers) ? config.servers : [],
+      servers: normalizeServers(config.servers),
       networkShares: Array.isArray(config.networkShares) ? config.networkShares : [],
       setup_token: typeof config.setup_token === 'string' && config.setup_token
         ? config.setup_token

@@ -525,6 +525,122 @@ function UserOverrides({ user, onChange, busy }) {
           </select>
         </div>
       </div>
+
+      <MusicAssistantOverride user={user} onChange={onChange} busy={busy} />
+      <PluginsOverride user={user} onChange={onChange} busy={busy} />
+    </div>
+  );
+}
+
+// Per-user Music Assistant connection. Free text → saved on button tap, not per
+// keystroke. Maps to the device's per-Jellyfin-user MA store via CompanionSyncWorker.
+function MusicAssistantOverride({ user, onChange, busy }) {
+  const ma = user.musicAssistant || {};
+  const [url, setUrl] = useState(ma.url || '');
+  const [token, setToken] = useState(ma.token || '');
+  const [username, setUsername] = useState(ma.username || '');
+  const [password, setPassword] = useState(ma.password || '');
+
+  const save = () => {
+    const next = {};
+    if (url.trim()) next.url = url.trim();
+    if (token.trim()) next.token = token.trim();
+    if (username.trim()) next.username = username.trim();
+    if (password.trim()) next.password = password.trim();
+    // No url ⇒ clear (the backend drops a urless musicAssistant on normalize).
+    onChange({ musicAssistant: next.url ? next : null });
+  };
+
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        padding: 10,
+        background: 'rgba(0,0,0,0.25)',
+        border: '1px solid var(--stroke-1)',
+        borderRadius: 8,
+      }}
+    >
+      <div className="eyebrow" style={{ marginBottom: 8, color: 'var(--teal-bright)' }}>
+        Music Assistant
+      </div>
+      <div className="col" style={{ gap: 6 }}>
+        <input
+          className="input"
+          placeholder="Server URL (http://192.168.1.89:8095)"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+        />
+        <input
+          className="input"
+          placeholder="Username (optional)"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+        />
+        <input
+          className="input"
+          type="password"
+          placeholder="Password (if using username)"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
+        <input
+          className="input"
+          type="password"
+          placeholder="Access token (optional)"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+        />
+        <div className="row" style={{ gap: 6 }}>
+          <button className="btn sm" onClick={save} disabled={busy}>Save Music Assistant</button>
+        </div>
+        <div className="muted" style={{ fontSize: 11 }}>
+          Applied to this user's headsets. Leave the URL empty and save to clear.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Per-user universal source plugins. One manifest URL per line; the device
+// installs them into this user's plugin scope on sync (additive).
+function PluginsOverride({ user, onChange, busy }) {
+  const [text, setText] = useState((user.plugins || []).join('\n'));
+
+  const save = () => {
+    const list = text.split('\n').map((s) => s.trim()).filter(Boolean);
+    onChange({ plugins: list });
+  };
+
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        padding: 10,
+        background: 'rgba(0,0,0,0.25)',
+        border: '1px solid var(--stroke-1)',
+        borderRadius: 8,
+      }}
+    >
+      <div className="eyebrow" style={{ marginBottom: 8, color: 'var(--teal-bright)' }}>
+        Universal Plugins
+      </div>
+      <div className="col" style={{ gap: 6 }}>
+        <textarea
+          className="input"
+          rows={3}
+          placeholder="One plugin manifest URL per line"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          style={{ resize: 'vertical', fontFamily: 'monospace', fontSize: 12 }}
+        />
+        <div className="row" style={{ gap: 6 }}>
+          <button className="btn sm" onClick={save} disabled={busy}>Save Plugins</button>
+        </div>
+        <div className="muted" style={{ fontSize: 11 }}>
+          Each headset signed in as this user installs these manifests on next sync.
+        </div>
+      </div>
     </div>
   );
 }
