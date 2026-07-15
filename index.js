@@ -8,6 +8,46 @@ const qrcode = require('qrcode');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const os = require('os');
+const originalNetworkInterfaces = os.networkInterfaces;
+let globalLocalIp = undefined;
+const _netsRaw = originalNetworkInterfaces();
+for (const name of Object.keys(_netsRaw)) {
+  for (const net of _netsRaw[name]) {
+    const isIPv4 = net.family === 'IPv4' || net.family === 4;
+    if (isIPv4 && !net.internal && net.address.startsWith('192.168.1.')) {
+      globalLocalIp = net.address;
+      break;
+    }
+  }
+  if (globalLocalIp) break;
+}
+if (!globalLocalIp) {
+  for (const name of Object.keys(_netsRaw)) {
+    for (const net of _netsRaw[name]) {
+      const isIPv4 = net.family === 'IPv4' || net.family === 4;
+      if (isIPv4 && !net.internal && !net.address.startsWith('172.') && !net.address.startsWith('192.168.96.')) {
+        globalLocalIp = net.address;
+        break;
+      }
+    }
+    if (globalLocalIp) break;
+  }
+}
+
+os.networkInterfaces = function() {
+  const nets = originalNetworkInterfaces();
+  const filtered = {};
+  for (const name of Object.keys(nets)) {
+    filtered[name] = nets[name].filter(net => {
+      if (globalLocalIp && net.address === globalLocalIp) return true;
+      if (!globalLocalIp && !net.internal) return true;
+      return false;
+    });
+    if (filtered[name].length === 0) delete filtered[name];
+  }
+  if (Object.keys(filtered).length === 0) return nets;
+  return filtered;
+};
 const { WebSocketServer, WebSocket } = require('ws');
 const helmet = require('helmet');
 const crypto = require('crypto');
@@ -15,6 +55,7 @@ const http = require('http');
 const https = require('https');
 const net = require('net');
 const dns = require('dns').promises;
+const Bonjour = require('bonjour-service').default;
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 const { DEFAULT_PREFERENCES } = require('./default-preferences');
@@ -2798,6 +2839,65 @@ app.post('/api/v1/analytics/sessions', (req, res) => {
   }
 });
 
+const activeFCastReceivers = new Map();
+
+app.post('/api/fcast/register', (req, res) => {
+  const { ip, port, name } = req.body;
+  if (!ip || !port || !name) {
+    return res.status(400).json({ error: 'Missing ip, port, or name' });
+  }
+  const id = `${ip}:${port}`;
+  activeFCastReceivers.set(id, { ip, port, name, lastSeen: Date.now() });
+  res.json({ status: 'ok' });
+});
+
+app.get('/api/fcast/receivers', cors(), (req, res) => {
+  const now = Date.now();
+  const receivers = [];
+  for (const [id, receiver] of activeFCastReceivers.entries()) {
+    if (now - receiver.lastSeen > 60000) { // Prune stale receivers older than 60 seconds
+      activeFCastReceivers.delete(id);
+    } else {
+      receivers.push(receiver);
+    }
+  }
+  res.json(receivers);
+});
+
+
+app.get('/api/auth/credentials', cors(), (req, res) => {
+  const servers = Array.isArray(appConfig.servers) ? appConfig.servers : [];
+  const credentialsList = [];
+  
+  for (const server of servers) {
+    const users = Array.isArray(server.users) ? server.users : [];
+    for (const user of users) {
+      credentialsList.push({
+        serverUrl: (server.addresses && server.addresses[0]) || '',
+        apiToken: user.access_token || '',
+        userId: user.id || 'unknown_id',
+        username: user.username || user.name || 'Companion User',
+        password: user.password || ''
+      });
+    }
+  }
+  
+  if (credentialsList.length > 0) {
+    return res.json(credentialsList);
+  }
+  
+  return res.status(404).json({ error: 'No configured credentials' });
+});
+
+app.get('/api/preferences', cors(), (req, res) => {
+  const prefs = appConfig.globalPreferences || {};
+  res.json({
+    seerr_enabled: prefs.pref_seerr_enabled === 'true',
+    seerr_url: prefs.pref_seerr_url || '',
+    seerr_api_key: prefs.pref_seerr_api_key || ''
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Start server
 // ---------------------------------------------------------------------------
@@ -2829,7 +2929,144 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 });
 
 wss = new WebSocketServer({ server });
-wss.on('connection', () => {
+
+
+
+const bonjour = new Bonjour();
+
+// Use bonjour to find other receivers on the network and add them to activeFCastReceivers
+const fcastBrowser = bonjour.find({ type: 'fcast' });
+fcastBrowser.on('up', (service) => {
+  if (service.addresses && service.addresses.length > 0) {
+    const ip = service.addresses.find(a => a.includes('.')) || service.addresses[0];
+    const id = `${ip}:${service.port}`;
+    const name = (service.txt && service.txt.appName) ? `${service.txt.appName} (${service.name})` : service.name;
+    activeFCastReceivers.set(id, { ip, port: service.port, name, lastSeen: Date.now() });
+  }
+});
+fcastBrowser.on('down', (service) => {
+  if (service.addresses && service.addresses.length > 0) {
+    const ip = service.addresses.find(a => a.includes('.')) || service.addresses[0];
+    const id = `${ip}:${service.port}`;
+    activeFCastReceivers.delete(id);
+  }
+});
+// Periodically poll known services to update their lastSeen
+setInterval(() => {
+  fcastBrowser.update();
+  for (const service of fcastBrowser.services) {
+    if (service.addresses && service.addresses.length > 0) {
+      const ip = service.addresses.find(a => a.includes('.')) || service.addresses[0];
+      const id = `${ip}:${service.port}`;
+      if (activeFCastReceivers.has(id)) {
+        activeFCastReceivers.get(id).lastSeen = Date.now();
+      }
+    }
+  }
+}, 30000);
+
+wss.on('connection', (ws, req) => {
+  if (req.url && req.url.startsWith('/api/fcast/receive')) {
+    let tcpSocket = null;
+    let mdnsService = null;
+    let messageBuffer = Buffer.alloc(0);
+
+    const bridgeServer = net.createServer((socket) => {
+      if (tcpSocket) {
+        socket.destroy(); // Only allow one sender at a time
+        return;
+      }
+      tcpSocket = socket;
+
+      // Send Version (opcode 11) and Initial (opcode 14) to identify ourselves as SpatialFin
+      // so the Android sender preserves metadata (especially splitAv role) in Play messages.
+      const sendFCastFrame = (opcode, jsonObj) => {
+        const jsonStr = JSON.stringify(jsonObj);
+        const jsonBytes = Buffer.from(jsonStr, 'utf8');
+        const size = 1 + jsonBytes.length;
+        const frame = Buffer.alloc(4 + size);
+        frame.writeUInt32LE(size, 0);
+        frame[4] = opcode;
+        jsonBytes.copy(frame, 5);
+        socket.write(frame);
+      };
+      sendFCastFrame(11, { version: 4 }); // Version
+      sendFCastFrame(14, {               // Initial (receiver info)
+        friendlyName: 'SpatialFin Web',
+        appName: 'SpatialFin Web',
+        appVersion: '1.0.0'
+      });
+      
+      socket.on('data', (data) => {
+        messageBuffer = Buffer.concat([messageBuffer, data]);
+        while (messageBuffer.length >= 4) {
+          const length = messageBuffer.readUInt32LE(0);
+          if (messageBuffer.length >= 4 + length) {
+            const payload = messageBuffer.subarray(4, 4 + length);
+            messageBuffer = messageBuffer.subarray(4 + length);
+            ws.send(payload); // Send without length prefix
+          } else {
+            break;
+          }
+        }
+      });
+      
+      socket.on('close', () => {
+        tcpSocket = null;
+      });
+      
+      socket.on('error', (err) => {
+        console.error('Bridge TCP socket error:', err);
+      });
+    });
+
+    bridgeServer.listen(0, '0.0.0.0', () => {
+      const port = bridgeServer.address().port;
+      const hostname = os.hostname();
+      const uniqueId = crypto.randomBytes(2).toString('hex');
+
+      mdnsService = bonjour.publish({
+        name: `SpatialFin Web (${hostname}-${uniqueId})`,
+        type: 'fcast',
+        protocol: 'tcp',
+        port: port,
+        host: globalLocalIp,
+        txt: { 
+          txtvers: '1',
+          appName: 'SpatialFin Web',
+          appVersion: '1.0.0'
+        }
+      });
+      mdnsService.on('error', (err) => {
+        console.error('mDNS error:', err);
+      });
+      console.log(`FCast Bridge started on port ${port} for Web App (${uniqueId}) at ${globalLocalIp || 'default IP'}`);
+    });
+
+    ws.on('message', (data) => {
+      if (tcpSocket) {
+        const lengthPrefix = Buffer.alloc(4);
+        lengthPrefix.writeUInt32LE(data.length, 0);
+        tcpSocket.write(Buffer.concat([lengthPrefix, data]));
+      }
+    });
+
+    ws.on('close', () => {
+      if (mdnsService) {
+        mdnsService.stop();
+        mdnsService = null;
+      }
+      if (tcpSocket) {
+        tcpSocket.destroy();
+        tcpSocket = null;
+      }
+      bridgeServer.close();
+      console.log('FCast Bridge closed');
+    });
+    
+    return;
+  }
+
   // Client connected for live log and analytics streaming.
 });
 

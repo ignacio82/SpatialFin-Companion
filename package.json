@@ -1,6 +1,6 @@
 {
   "name": "spatialfin-companion",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "",
   "main": "index.js",
   "scripts": {
@@ -14,6 +14,7 @@
   "type": "commonjs",
   "dependencies": {
     "body-parser": "^2.2.2",
+    "bonjour-service": "^1.4.3",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "express-rate-limit": "^8.3.1",
