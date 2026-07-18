@@ -2877,7 +2877,8 @@ app.get('/api/auth/credentials', cors(), (req, res) => {
         apiToken: user.access_token || '',
         userId: user.id || 'unknown_id',
         username: user.username || user.name || 'Companion User',
-        password: user.password || ''
+        password: user.password || '',
+        musicAssistant: user.musicAssistant || null
       });
     }
   }
