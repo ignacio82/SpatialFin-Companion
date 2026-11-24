@@ -10,10 +10,11 @@ const {
   sortAndDedupeDiscoveryResults
 } = require('../share-discovery');
 
-test('extractHostFromAuthority handles host headers and forwarded hosts', () => {
+test('extractHostFromAuthority handles host headers and forwarded hosts (rightmost hop)', () => {
   assert.equal(extractHostFromAuthority('192.168.1.92:1982'), '192.168.1.92');
   assert.equal(extractHostFromAuthority('companion.local:1982'), 'companion.local');
-  assert.equal(extractHostFromAuthority('192.168.1.92:1982, 10.0.0.2:1982'), '192.168.1.92');
+  assert.equal(extractHostFromAuthority('192.168.1.92:1982, 10.0.0.2:1982'), '10.0.0.2');
+  assert.equal(extractHostFromAuthority(['192.168.1.92:1982', '10.0.0.5:1982, ']), '10.0.0.5');
   assert.equal(extractHostFromAuthority('[fe80::1]:1982'), 'fe80::1');
 });
 

@@ -1,41 +1,80 @@
-// SpatialFin Companion websocket client.
-// The server broadcasts:
-//   { type: 'new_logs', deviceId, logs }
-//   { type: 'analytics_sessions_ingested' }
-//   { type: 'analytics_sync_completed' }
-//   { type: 'config_changed', deviceId }
+// SpatialFin Companion admin WebSocket client.
+// Connects to /ws only after auth-check confirms wsAllowed === true.
 import { useEffect, useRef } from 'react';
+import { api } from './api.js';
 
 let socket = null;
+let wsAllowed = false;
 let listeners = new Set();
 let reconnectTimer = null;
 
+function clearReconnect() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
 function connect() {
-  if (typeof window === 'undefined') return;
+  if (typeof window === 'undefined' || !wsAllowed || socket) return;
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  socket = new WebSocket(protocol + '//' + window.location.host);
-  socket.onmessage = (event) => {
+  const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+  socket = ws;
+
+  ws.onmessage = (event) => {
     let data;
     try { data = JSON.parse(event.data); } catch (_) { return; }
     listeners.forEach((fn) => {
       try { fn(data); } catch (_) {}
     });
   };
-  socket.onclose = () => {
-    socket = null;
+
+  ws.onclose = (event) => {
+    if (socket === ws) socket = null;
+    if (!wsAllowed) return;
     if (reconnectTimer) return;
-    reconnectTimer = setTimeout(() => {
+
+    const code = event?.code;
+    const scheduleReconnect = async () => {
       reconnectTimer = null;
+      if (!wsAllowed) return;
+      if (code === 1006 || code === 4401) {
+        try {
+          const check = await api.authCheck();
+          if (!check?.wsAllowed) {
+            wsAllowed = false;
+            return;
+          }
+        } catch (_) {
+          wsAllowed = false;
+          return;
+        }
+      }
       connect();
-    }, 5000);
+    };
+    reconnectTimer = setTimeout(scheduleReconnect, 5000);
   };
-  socket.onerror = () => {
-    try { socket && socket.close(); } catch (_) {}
+
+  ws.onerror = () => {
+    try { ws.close(); } catch (_) {}
   };
 }
 
+export function setWebSocketAuthAllowed(allowed) {
+  wsAllowed = Boolean(allowed);
+  if (!wsAllowed) {
+    clearReconnect();
+    if (socket) {
+      try { socket.close(); } catch (_) {}
+      socket = null;
+    }
+  } else {
+    connect();
+  }
+}
+
 export function startWebSocket() {
-  if (!socket) connect();
+  if (wsAllowed && !socket) connect();
 }
 
 export function useWebSocketEvent(type, handler) {
@@ -43,7 +82,7 @@ export function useWebSocketEvent(type, handler) {
   handlerRef.current = handler;
 
   useEffect(() => {
-    startWebSocket();
+    if (wsAllowed) startWebSocket();
     const fn = (data) => {
       if (!type || data.type === type) handlerRef.current && handlerRef.current(data);
     };

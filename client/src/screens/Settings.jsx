@@ -2,9 +2,9 @@ import { useEffect, useMemo, useState } from 'react';
 import Icon from '../components/Icon.jsx';
 import Toggle from '../components/Toggle.jsx';
 import Segmented from '../components/Segmented.jsx';
+import Modal from '../components/Modal.jsx';
 import { api } from '../api.js';
 
-// Helpers: server stores preferences as string values. Convert to/from booleans.
 const toBool = (v) => v === 'true' || v === true;
 const fromBool = (v) => (v ? 'true' : 'false');
 
@@ -28,13 +28,23 @@ const LANG_OPTIONS = [
 
 export default function Settings({ config, reloadConfig, onToast }) {
   const [draft, setDraft] = useState(() => ({ ...(config?.globalPreferences || {}) }));
+  const [draftBaseVersion, setDraftBaseVersion] = useState(() => config?.configVersion ?? null);
   const [busy, setBusy] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const [conflict, setConflict] = useState(false);
+  const [diagnostics, setDiagnostics] = useState(null);
+  const [importDropConfirm, setImportDropConfirm] = useState(null);
 
   useEffect(() => {
-    setDraft({ ...(config?.globalPreferences || {}) });
-    setDirty(false);
-  }, [config]);
+    if (!dirty) {
+      setDraft({ ...(config?.globalPreferences || {}) });
+      setDraftBaseVersion(config?.configVersion ?? null);
+    }
+  }, [config, dirty]);
+
+  useEffect(() => {
+    api.diagnostics().then(setDiagnostics).catch(() => {});
+  }, [config?.configVersion]);
 
   function setKey(key, value) {
     setDraft((d) => ({ ...d, [key]: value }));
@@ -50,20 +60,58 @@ export default function Settings({ config, reloadConfig, onToast }) {
     setKey('pref_smart_spoken_languages', arr.filter(Boolean).join(','));
   }
 
+  async function reloadLatest() {
+    setConflict(false);
+    const latest = await reloadConfig?.();
+    setDraft({ ...((latest || config)?.globalPreferences || {}) });
+    setDraftBaseVersion((latest || config)?.configVersion ?? null);
+    setDirty(false);
+  }
+
   async function save() {
     if (busy) return;
     setBusy(true);
+    setConflict(false);
     try {
-      const next = {
-        ...config,
-        globalPreferences: draft,
-      };
-      await api.setConfig(next);
+      await api.setConfig({ globalPreferences: draft }, draftBaseVersion);
+      setDirty(false);
       await reloadConfig?.();
       onToast?.('Global settings saved', 'success');
-      setDirty(false);
     } catch (e) {
-      onToast?.('Save failed: ' + e.message, 'error');
+      if (e?.status === 409) {
+        setConflict(true);
+        onToast?.('Configuration changed in another session — reload latest', 'warning');
+      } else {
+        onToast?.('Save failed: ' + e.message, 'error');
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runImport(parsed, expectedVersion, confirmDropUnmatchedSecrets = false) {
+    setBusy(true);
+    setConflict(false);
+    try {
+      const payload = confirmDropUnmatchedSecrets ? { ...parsed, confirmDropUnmatchedSecrets: true } : parsed;
+      await api.importConfig(payload, expectedVersion);
+      setImportDropConfirm(null);
+      setDirty(false);
+      await reloadConfig?.();
+      onToast?.('Config imported', 'success');
+    } catch (e) {
+      if (e?.status === 409) {
+        setConflict(true);
+        onToast?.('Configuration changed in another session — reload latest', 'warning');
+      } else if (e?.status === 400 && (e?.errorCode === 'redacted_secret_mismatch' || e?.errorCode === 'share_password_required')) {
+        setImportDropConfirm({
+          parsed,
+          expectedVersion,
+          unmatched: e?.payload?.unmatchedSecrets || [],
+        });
+      } else {
+        onToast?.('Import failed: ' + e.message, 'error');
+      }
     } finally {
       setBusy(false);
     }
@@ -74,9 +122,7 @@ export default function Settings({ config, reloadConfig, onToast }) {
     try {
       const text = await file.text();
       const parsed = JSON.parse(text);
-      await api.importConfig(parsed);
-      await reloadConfig?.();
-      onToast?.('Config imported', 'success');
+      await runImport(parsed, config?.configVersion, false);
     } catch (e) {
       onToast?.('Import failed: ' + e.message, 'error');
     }
@@ -84,6 +130,14 @@ export default function Settings({ config, reloadConfig, onToast }) {
 
   return (
     <div className="col" style={{ gap: 14 }} data-screen-label="03 Global Settings">
+      {conflict && (
+        <div className="card" style={{ borderColor: 'rgba(255,181,71,0.5)' }}>
+          <div className="row between wrap" style={{ gap: 8 }}>
+            <span style={{ fontSize: 12.5 }}>Configuration changed in another session. Your unsaved draft is preserved below.</span>
+            <button type="button" className="btn sm primary" onClick={reloadLatest}>Reload latest</button>
+          </div>
+        </div>
+      )}
 
       <div className="card">
         <div className="card-head">
@@ -118,6 +172,7 @@ export default function Settings({ config, reloadConfig, onToast }) {
                 <div key={l + i} className="chip" style={{ paddingRight: 4 }}>
                   <span className="tnum muted" style={{ marginRight: 2 }}>{i + 1}</span> {l}
                   <button
+                    type="button"
                     className="btn icon-only sm ghost"
                     style={{ height: 18, width: 18 }}
                     onClick={() => setSpokenLangs(spokenLangs.filter((_, idx) => idx !== i))}
@@ -238,7 +293,7 @@ export default function Settings({ config, reloadConfig, onToast }) {
         <div className="setting-row">
           <div>
             <div className="lbl">Voice control enabled</div>
-            <div className="desc">Hands-free wake & control on headsets.</div>
+            <div className="desc">Hands-free wake &amp; control on headsets.</div>
           </div>
           <div className="ctl">
             <Toggle
@@ -301,7 +356,7 @@ export default function Settings({ config, reloadConfig, onToast }) {
             <div className="lbl">
               On-device Gemma <span className="chip teal uc" style={{ marginLeft: 6 }}>LiteRT</span>
             </div>
-            <div className="desc">SpatialFin downloads & uses LiteRT Gemma on supported headsets.</div>
+            <div className="desc">SpatialFin downloads &amp; uses LiteRT Gemma on supported headsets.</div>
           </div>
           <div className="ctl">
             <Toggle
@@ -322,7 +377,7 @@ export default function Settings({ config, reloadConfig, onToast }) {
         <div className="setting-row">
           <div>
             <div className="lbl">Enable companion logging</div>
-            <div className="desc">SpatialFin streams new log lines back here for inspection & download.</div>
+            <div className="desc">SpatialFin streams new log lines back here for inspection &amp; download.</div>
           </div>
           <div className="ctl">
             <Toggle
@@ -331,18 +386,65 @@ export default function Settings({ config, reloadConfig, onToast }) {
             />
           </div>
         </div>
+        {diagnostics?.configPulls && (
+          <div className="setting-row">
+            <div>
+              <div className="lbl">Config sync compatibility</div>
+              <div className="desc">
+                Total pulls: {diagnostics.configPulls.total} · Quick Connect broker: {diagnostics.configPulls.qcBroker} · Legacy: {diagnostics.configPulls.legacy} (last 60d: {diagnostics.configPulls.last60DaysLegacy})
+              </div>
+            </div>
+            <div className="ctl">
+              <span className={'chip ' + (diagnostics.legacySunsetReady ? 'ok' : '')}>
+                {diagnostics.legacySunsetReady ? 'Legacy sunset ready' : 'Tracking legacy clients'}
+              </span>
+            </div>
+          </div>
+        )}
       </div>
 
-      <SnapshotsCard reloadConfig={reloadConfig} onToast={onToast} importFile={importFile}/>
+      <SnapshotsCard
+        configVersion={config?.configVersion}
+        reloadConfig={reloadConfig}
+        onConflict={() => setConflict(true)}
+        onToast={onToast}
+        importFile={importFile}
+      />
 
       <div className="row" style={{ justifyContent: 'flex-end', gap: 8 }}>
-        <button className="btn" disabled={!dirty} onClick={() => { setDraft({ ...(config?.globalPreferences || {}) }); setDirty(false); }}>
+        <button type="button" className="btn" disabled={!dirty} onClick={reloadLatest}>
           Discard
         </button>
-        <button className="btn primary" disabled={!dirty || busy} onClick={save}>
+        <button type="button" className="btn primary" disabled={!dirty || busy} onClick={save}>
           <Icon name="check" size={13}/> {busy ? 'Saving…' : 'Save Global Settings'}
         </button>
       </div>
+
+      {importDropConfirm && (
+        <Modal
+          title="Import with unmatched secrets?"
+          eyebrow="Config Import"
+          width={480}
+          onClose={() => setImportDropConfirm(null)}
+          footer={
+            <>
+              <button type="button" className="btn" onClick={() => setImportDropConfirm(null)}>Cancel</button>
+              <button
+                type="button"
+                className="btn danger"
+                disabled={busy}
+                onClick={() => runImport(importDropConfirm.parsed, importDropConfirm.expectedVersion, true)}
+              >
+                Import &amp; drop unmatched secrets
+              </button>
+            </>
+          }
+        >
+          <div style={{ fontSize: 13, color: 'var(--t-1)', lineHeight: 1.55 }}>
+            The imported file contains redacted secret placeholders that do not match this instance's stored credentials ({importDropConfirm.unmatched.join(', ')}). Confirm to import while clearing those secrets.
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
@@ -384,7 +486,7 @@ function NumberRow({ label, hint, prefKey, draft, onChange }) {
   );
 }
 
-function SnapshotsCard({ reloadConfig, onToast, importFile }) {
+function SnapshotsCard({ configVersion, reloadConfig, onConflict, onToast, importFile }) {
   const [snapshots, setSnapshots] = useState([]);
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState(false);
@@ -406,10 +508,17 @@ function SnapshotsCard({ reloadConfig, onToast, importFile }) {
   async function restore(id) {
     if (!confirm('Restore this snapshot? The current config will be replaced (and itself snapshotted).')) return;
     try {
-      await api.restoreSnapshot(id);
+      await api.restoreSnapshot(id, configVersion);
       await reloadConfig?.();
       onToast?.('Snapshot restored', 'success');
-    } catch (e) { onToast?.('Restore failed: ' + e.message, 'error'); }
+    } catch (e) {
+      if (e?.status === 409) {
+        onConflict?.();
+        onToast?.('Configuration changed in another session — reload latest', 'warning');
+      } else {
+        onToast?.('Restore failed: ' + e.message, 'error');
+      }
+    }
   }
 
   return (
@@ -420,12 +529,12 @@ function SnapshotsCard({ reloadConfig, onToast, importFile }) {
           <span className="title">Config Snapshot &amp; History</span>
         </div>
         <div className="right">
-          <button className="btn ghost sm" onClick={() => setOpen((o) => !o)}>
+          <button type="button" className="btn ghost sm" onClick={() => setOpen((o) => !o)}>
             {open ? 'Hide history' : 'Show history'}
           </button>
         </div>
       </div>
-      <div className="row wrap" style={{ gap: 8 }}>
+      <div className="row wrap" style={{ gap: 8, alignItems: 'center' }}>
         <a className="btn sm" href={api.exportConfigUrl()} style={{ textDecoration: 'none' }}>
           <Icon name="download" size={13}/> Export config.json
         </a>
@@ -435,9 +544,12 @@ function SnapshotsCard({ reloadConfig, onToast, importFile }) {
             type="file"
             accept="application/json,.json"
             style={{ display: 'none' }}
-            onChange={(e) => importFile(e.target.files?.[0])}
+            onChange={(e) => { importFile(e.target.files?.[0]); e.target.value = ''; }}
           />
         </label>
+        <span className="muted" style={{ fontSize: 11 }}>
+          Secrets (API keys, tokens, share passwords) are redacted and excluded from exports.
+        </span>
       </div>
       {open && (
         <div style={{ marginTop: 14 }}>
@@ -462,7 +574,7 @@ function SnapshotsCard({ reloadConfig, onToast, importFile }) {
                     </td>
                     <td className="muted">{s.reason || 'config-update'}</td>
                     <td>
-                      <button className="btn ghost sm" onClick={() => restore(s.id)}>Restore</button>
+                      <button type="button" className="btn ghost sm" onClick={() => restore(s.id)}>Restore</button>
                     </td>
                   </tr>
                 ))}
@@ -480,7 +592,7 @@ function AddLangButton({ onAdd }) {
   const [v, setV] = useState('');
   if (!open) {
     return (
-      <button className="btn sm ghost" onClick={() => setOpen(true)}>
+      <button type="button" className="btn sm ghost" onClick={() => setOpen(true)}>
         <Icon name="plus" size={12}/> Add language
       </button>
     );

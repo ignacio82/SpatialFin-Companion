@@ -16,6 +16,8 @@ let lastCheckAt = null;
 let lastCheckStatus = null;
 let latestReleaseTag = null;
 let timer = null;
+let initialTimer = null;
+let onRestartRequested = null;
 
 function readCurrentVersion() {
   try {
@@ -101,7 +103,17 @@ async function checkOnce() {
       lastCheckStatus = `update-available ${current} -> ${tag}; exiting for restart`;
       console.log(`[updater] ${tag} available (running ${current}); exiting so the container restarts onto the new tag.`);
       // Small delay so the log line flushes and any in-flight response completes.
-      setTimeout(() => process.exit(0), 1000);
+      const exitTimer = setTimeout(async () => {
+        if (typeof onRestartRequested === 'function') {
+          try {
+            await onRestartRequested();
+          } catch (_) {
+            // Best-effort graceful shutdown before exit.
+          }
+        }
+        process.exit(0);
+      }, 1000);
+      if (typeof exitTimer.unref === 'function') exitTimer.unref();
       return;
     }
     lastCheckStatus = `up-to-date (running ${current}, latest ${tag})`;
@@ -110,21 +122,38 @@ async function checkOnce() {
   }
 }
 
-function start() {
+function start(options = {}) {
+  if (typeof options.onRestart === 'function') {
+    onRestartRequested = options.onRestart;
+  }
   if (!AUTO_UPDATE) {
     lastCheckStatus = 'disabled (COMPANION_AUTO_UPDATE=false)';
     console.log('[updater] auto-update disabled via COMPANION_AUTO_UPDATE=false');
     return;
   }
-  if (timer) return;
+  if (timer || initialTimer) return;
   // First check one minute after boot so we don't race the server's startup.
-  setTimeout(() => {
+  initialTimer = setTimeout(() => {
+    initialTimer = null;
     checkOnce().catch(() => {});
   }, 60 * 1000);
+  if (typeof initialTimer.unref === 'function') initialTimer.unref();
   timer = setInterval(() => {
     checkOnce().catch(() => {});
   }, CHECK_INTERVAL_MS);
   if (typeof timer.unref === 'function') timer.unref();
+}
+
+function stop() {
+  if (initialTimer) {
+    clearTimeout(initialTimer);
+    initialTimer = null;
+  }
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+  onRestartRequested = null;
 }
 
 function getStatus() {
@@ -139,4 +168,4 @@ function getStatus() {
   };
 }
 
-module.exports = { start, checkOnce, getStatus };
+module.exports = { start, stop, checkOnce, getStatus };

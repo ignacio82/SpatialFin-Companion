@@ -12,7 +12,17 @@ function parsePort(value) {
 
 function parseHostPort(value) {
   const raw = trimText(value, 512);
-  if (!raw || raw.startsWith('[')) {
+  if (!raw) {
+    return { host: '', port: null };
+  }
+  const ipv6Match = raw.match(/^\[([^\]]+)\](?::(\d+))?$/);
+  if (ipv6Match) {
+    return {
+      host: ipv6Match[1],
+      port: ipv6Match[2] ? parsePort(ipv6Match[2]) : null
+    };
+  }
+  if (raw.startsWith('[')) {
     return { host: raw, port: null };
   }
   const match = raw.match(/^([^:]+):(\d+)$/);
@@ -187,6 +197,14 @@ function normalizeSmbShare(input = {}) {
   if (parsedHost.port && !normalized.port) normalized.port = parsedHost.port;
   normalized.path = normalizeShareRelativePath(normalized.path);
 
+  if (!normalized.shareName && normalized.path) {
+    const pathParts = normalized.path.split('\\').filter(Boolean);
+    if (pathParts.length > 0) {
+      normalized.shareName = pathParts[0];
+      normalized.path = pathParts.slice(1).join('\\');
+    }
+  }
+
   return normalized;
 }
 
@@ -221,8 +239,13 @@ function normalizeNfsShare(input = {}) {
   const parsedHost = parseHostPort(normalized.host);
   normalized.host = parsedHost.host;
   if (parsedHost.port && !normalized.port) normalized.port = parsedHost.port;
-  normalized.shareName = normalizeNfsExportPath(normalized.shareName, { allowRoot: true });
-  normalized.path = normalizeNfsRelativePath(normalized.path);
+  if (!normalized.shareName && normalized.path) {
+    normalized.shareName = normalizeNfsExportPath(normalized.path, { allowRoot: true });
+    normalized.path = '';
+  } else {
+    normalized.shareName = normalizeNfsExportPath(normalized.shareName, { allowRoot: true });
+    normalized.path = normalizeNfsRelativePath(normalized.path);
+  }
 
   return normalized;
 }

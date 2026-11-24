@@ -1,11 +1,26 @@
+'use strict';
+
+const os = require('node:os');
 const { isPrivateIpv4 } = require('./tv-pairing');
+const { isUlaIpv6, stripBrackets } = require('./safe-fetch');
+
+const VIRTUAL_IFACE_PATTERN = /^(docker\d*|br-[0-9a-f]+|veth[0-9a-f]+|virbr\d*|cni\d*|flannel\.\d+|kube-|podman\d*|tailscale\d*|wg\d*|tun\d*|tap\d*|zt[0-9a-z]+)$/i;
+
+function extractRightmostHeaderValue(raw) {
+  const items = Array.isArray(raw) ? raw : [raw];
+  const parts = [];
+  for (const item of items) {
+    if (item === undefined || item === null) continue;
+    for (const seg of String(item).split(',')) {
+      const trimmed = seg.trim();
+      if (trimmed) parts.push(trimmed);
+    }
+  }
+  return parts.length > 0 ? parts[parts.length - 1] : '';
+}
 
 function extractHostFromAuthority(authority) {
-  const value = String(authority || '')
-    .split(',')
-    .map((part) => part.trim())
-    .find(Boolean) || '';
-
+  const value = extractRightmostHeaderValue(authority);
   if (!value) return '';
   if (value.startsWith('[')) {
     const endIndex = value.indexOf(']');
@@ -19,6 +34,109 @@ function extractHostFromAuthority(authority) {
   return value.trim();
 }
 
+function isIpv4Family(family) {
+  return family === 'IPv4' || family === 4;
+}
+
+function isIpv6Family(family) {
+  return family === 'IPv6' || family === 6;
+}
+
+function getScanNetworkInterfaces(rawInterfaces = os.networkInterfaces()) {
+  const source = rawInterfaces && typeof rawInterfaces === 'object' ? rawInterfaces : {};
+  const physical = {};
+  const fallback = {};
+
+  for (const name of Object.keys(source)) {
+    const entries = Array.isArray(source[name]) ? source[name] : [];
+    const usable = entries.filter((iface) => {
+      if (!iface || iface.internal || !iface.address) return false;
+      const addr = stripBrackets(String(iface.address).split('%')[0]);
+      if (isIpv4Family(iface.family)) return isPrivateIpv4(addr);
+      if (isIpv6Family(iface.family)) return isUlaIpv6(addr);
+      return false;
+    }).map((iface) => ({
+      ...iface,
+      family: isIpv4Family(iface.family) ? 'IPv4' : 'IPv6',
+      address: stripBrackets(String(iface.address).split('%')[0]),
+    }));
+
+    if (usable.length === 0) continue;
+    if (VIRTUAL_IFACE_PATTERN.test(name)) {
+      fallback[name] = usable;
+    } else {
+      physical[name] = usable;
+    }
+  }
+
+  if (Object.keys(physical).length > 0) {
+    return physical;
+  }
+  return fallback;
+}
+
+function getPrimaryLanIpv4(rawInterfaces) {
+  const ifaces = getScanNetworkInterfaces(rawInterfaces);
+  const candidates = [];
+  for (const [name, list] of Object.entries(ifaces)) {
+    for (const iface of list) {
+      if (iface.family === 'IPv4' && isPrivateIpv4(iface.address)) {
+        candidates.push({ name, address: iface.address });
+      }
+    }
+  }
+  if (candidates.length === 0) return null;
+  // Prefer non-172.16-31 RFC1918 addresses (typical home LANs 192.168.x.x / 10.x.x.x) over docker-like 172.x
+  candidates.sort((a, b) => {
+    const aIs172 = a.address.startsWith('172.') ? 1 : 0;
+    const bIs172 = b.address.startsWith('172.') ? 1 : 0;
+    if (aIs172 !== bIs172) return aIs172 - bIs172;
+    const aIs192 = a.address.startsWith('192.168.') ? 0 : 1;
+    const bIs192 = b.address.startsWith('192.168.') ? 0 : 1;
+    if (aIs192 !== bIs192) return aIs192 - bIs192;
+    return compareIpv4(a.address, b.address);
+  });
+  return candidates[0].address;
+}
+
+function getPrimaryLanIpv4WithInterface(rawInterfaces) {
+  const ifaces = getScanNetworkInterfaces(rawInterfaces);
+  const candidates = [];
+  for (const [name, list] of Object.entries(ifaces)) {
+    for (const iface of list) {
+      if (iface.family === 'IPv4' && isPrivateIpv4(iface.address)) {
+        candidates.push({ name, address: iface.address });
+      }
+    }
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => {
+    const aIs172 = a.address.startsWith('172.') ? 1 : 0;
+    const bIs172 = b.address.startsWith('172.') ? 1 : 0;
+    if (aIs172 !== bIs172) return aIs172 - bIs172;
+    const aIs192 = a.address.startsWith('192.168.') ? 0 : 1;
+    const bIs192 = b.address.startsWith('192.168.') ? 0 : 1;
+    if (aIs192 !== bIs192) return aIs192 - bIs192;
+    return compareIpv4(a.address, b.address);
+  });
+  return candidates[0];
+}
+
+function getPrimaryLanUlaIpv6(rawInterfaces) {
+  const ifaces = getScanNetworkInterfaces(rawInterfaces);
+  const candidates = [];
+  for (const list of Object.values(ifaces)) {
+    for (const iface of list) {
+      if (iface.family === 'IPv6' && isUlaIpv6(iface.address)) {
+        candidates.push(iface.address);
+      }
+    }
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort();
+  return candidates[0];
+}
+
 function collectPrivateIpv4SeedAddresses(networkInterfaces, extraHosts = []) {
   const seen = new Set();
   const seeds = [];
@@ -26,7 +144,7 @@ function collectPrivateIpv4SeedAddresses(networkInterfaces, extraHosts = []) {
 
   Object.keys(interfaces).forEach((name) => {
     (interfaces[name] || []).forEach((iface) => {
-      if (!iface || iface.internal || iface.family !== 'IPv4' || !isPrivateIpv4(iface.address)) return;
+      if (!iface || iface.internal || !isIpv4Family(iface.family) || !isPrivateIpv4(iface.address)) return;
       if (seen.has(iface.address)) return;
       seen.add(iface.address);
       seeds.push(iface.address);
@@ -154,6 +272,11 @@ module.exports = {
   collectPrivateIpv4SeedAddresses,
   describePrivateIpv4Subnets,
   extractHostFromAuthority,
+  extractRightmostHeaderValue,
+  getPrimaryLanIpv4,
+  getPrimaryLanIpv4WithInterface,
+  getPrimaryLanUlaIpv6,
+  getScanNetworkInterfaces,
   parseSmbClientShareList,
   sortAndDedupeDiscoveryResults
 };

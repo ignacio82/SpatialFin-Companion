@@ -10,6 +10,8 @@
 // context: title, a short snippet, and the source URL. Everything else
 // (favicons, engine names, thumbnails, infoboxes) is discarded.
 
+const { safeFetch, POLICY_PUBLIC_OR_LAN, SsrfBlockedError } = require('./safe-fetch');
+
 const DEFAULT_TIMEOUT_MS = 5_000;
 const MAX_RESULTS = 8;
 const SNIPPET_CHAR_CAP = 320;
@@ -71,30 +73,45 @@ function validateQuery(query) {
  *   timeoutMs?: number,
  * }} opts
  */
-async function performSearch({ query, searxngUrl, fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+async function performSearch({ query, searxngUrl, fetchImpl = safeFetch, timeoutMs = DEFAULT_TIMEOUT_MS }) {
   const validation = validateQuery(query);
   if (!validation.ok) {
     const err = new Error(validation.reason);
     err.status = 400;
+    err.errorCode = 'invalid_request';
     throw err;
   }
   const url = buildSearxngUrl({ query: validation.query, searxngUrl });
   const controller = new AbortController();
   const abortTimer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetchImpl(url, {
+    const fetchOpts = {
       method: 'GET',
       signal: controller.signal,
       headers: { Accept: 'application/json' },
-    });
+      redirect: 'error',
+    };
+    if (fetchImpl === safeFetch) {
+      fetchOpts.policy = POLICY_PUBLIC_OR_LAN;
+      fetchOpts.allowLoopback = true;
+      fetchOpts.maxRedirects = 0;
+    }
+    const response = await fetchImpl(url, fetchOpts);
     if (!response.ok) {
       const err = new Error(`SearXNG responded ${response.status}`);
       err.status = 502;
+      err.errorCode = 'server_unreachable';
       throw err;
     }
     const payload = await response.json();
     return shapeSearchResults(payload);
   } catch (e) {
+    if (e instanceof SsrfBlockedError || e.code === 'ssrf_blocked' || e.errorCode === 'ssrf_blocked') {
+      const err = new Error(e.message || 'SearXNG target blocked by SSRF policy');
+      err.status = 400;
+      err.errorCode = 'ssrf_blocked';
+      throw err;
+    }
     if (e.name === 'AbortError') {
       const err = new Error('SearXNG request timed out');
       err.status = 504;
@@ -103,6 +120,7 @@ async function performSearch({ query, searxngUrl, fetchImpl = fetch, timeoutMs =
     if (e.status) throw e;
     const wrapped = new Error(`SearXNG request failed: ${e.message || e}`);
     wrapped.status = 502;
+    wrapped.errorCode = 'server_unreachable';
     throw wrapped;
   } finally {
     clearTimeout(abortTimer);

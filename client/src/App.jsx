@@ -4,6 +4,7 @@ import TopBar from './components/TopBar.jsx';
 import MobileBar from './components/MobileBar.jsx';
 import CommandPalette from './components/CommandPalette.jsx';
 import Login from './components/Login.jsx';
+import Modal from './components/Modal.jsx';
 import Dashboard from './screens/Dashboard.jsx';
 import Analytics from './screens/Analytics.jsx';
 import Settings from './screens/Settings.jsx';
@@ -13,7 +14,7 @@ import Servers from './screens/Servers.jsx';
 import Shares from './screens/Shares.jsx';
 import Security from './screens/Security.jsx';
 import { api } from './api.js';
-import { useWebSocketEvent } from './ws.js';
+import { setWebSocketAuthAllowed, useWebSocketEvent } from './ws.js';
 
 const NAV = [
   { group: 'Overview', items: [
@@ -56,7 +57,7 @@ const SCREEN_META = {
   security: {
     crumbs: ['Companion', 'Configuration', 'Security'],
     title: 'Security',
-    sub: 'Enforce app-lock policy at the headset level. Changes propagate over WebSocket in seconds.',
+    sub: 'Configure app-lock wipe policy pushed to enrolled devices.',
   },
   servers: {
     crumbs: ['Companion', 'Infrastructure', 'Servers & Users'],
@@ -78,7 +79,9 @@ const SCREEN_META = {
 const VALID_SCREENS = Object.keys(SCREEN_META);
 
 export default function App() {
-  const [authState, setAuthState] = useState('checking'); // checking | open | needs-login | authed
+  // checking | open | needs-bootstrap | needs-login | authed | host-rejected
+  const [authState, setAuthState] = useState('checking');
+  const [bootstrapMeta, setBootstrapMeta] = useState({ canBootstrapWithPin: false, bootstrapPinExpiresAt: null });
   const [meta, setMeta] = useState(null);
   const [config, setConfig] = useState(null);
   const [screen, setScreen] = useState(() => {
@@ -87,27 +90,44 @@ export default function App() {
   });
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [cmdOpen, setCmdOpen] = useState(false);
+  const [rotateConfirmOpen, setRotateConfirmOpen] = useState(false);
+  const [rotatingToken, setRotatingToken] = useState(false);
   const [toast, setToast] = useState(null);
 
   const reloadConfig = useCallback(async () => {
     try {
       const c = await api.getConfig();
       setConfig(c);
-    } catch (_) { /* keep prior */ }
+      return c;
+    } catch (_) {
+      return null;
+    }
   }, []);
 
   const checkAuth = useCallback(async () => {
     try {
       const check = await api.authCheck();
-      if (check && check.authRequired === false) {
+      setWebSocketAuthAllowed(Boolean(check?.wsAllowed));
+      if (check?.adminPasswordRequired && !check?.authenticated) {
+        setBootstrapMeta({
+          canBootstrapWithPin: Boolean(check.canBootstrapWithPin),
+          bootstrapPinExpiresAt: check.bootstrapPinExpiresAt || null,
+        });
+        setAuthState('needs-bootstrap');
+      } else if (check?.authRequired === false) {
         setAuthState('open');
-      } else if (check && check.authenticated) {
+      } else if (check?.authenticated) {
         setAuthState('authed');
       } else {
         setAuthState('needs-login');
       }
-    } catch (_) {
-      setAuthState('needs-login');
+    } catch (err) {
+      setWebSocketAuthAllowed(false);
+      if (err?.status === 403 && err?.errorCode === 'host_rejected') {
+        setAuthState('host-rejected');
+      } else {
+        setAuthState('needs-login');
+      }
     }
   }, []);
 
@@ -161,7 +181,7 @@ export default function App() {
   }, []);
 
   async function login(password, remember) {
-    await api.login(password);
+    await api.login(password, Boolean(remember));
     if (remember) {
       try { localStorage.setItem('sf-companion-remember', '1'); } catch (_) {}
     }
@@ -169,28 +189,61 @@ export default function App() {
     await reloadConfig();
   }
 
+  async function bootstrap({ bootstrapPin, newPassword, remember }) {
+    await api.bootstrapPassword({ bootstrapPin, newPassword, remember: Boolean(remember) });
+    await checkAuth();
+    await reloadConfig();
+  }
+
   async function signOut() {
+    setWebSocketAuthAllowed(false);
     try { await api.logout(); } catch (_) {}
     setAuthState('needs-login');
     setConfig(null);
   }
 
+  const requestRotateToken = useCallback(() => {
+    setRotateConfirmOpen(true);
+  }, []);
+
+  async function confirmRotateToken() {
+    setRotatingToken(true);
+    try {
+      await api.rotateToken();
+      await reloadConfig();
+      setRotateConfirmOpen(false);
+      onToast('Setup token rotated — re-pair existing devices with the new QR/token', 'success');
+    } catch (e) {
+      onToast('Rotate failed: ' + e.message, 'error');
+    } finally {
+      setRotatingToken(false);
+    }
+  }
+
   const screenMeta = SCREEN_META[screen] || SCREEN_META.dashboard;
-  const screenProps = { config, reloadConfig, version: meta?.version, onNavigate: navigate, onToast };
+  const screenProps = {
+    config,
+    reloadConfig,
+    version: meta?.version,
+    onNavigate: navigate,
+    onToast,
+    onRequestRotateToken: requestRotateToken,
+  };
 
   const cmdActions = useMemo(() => [
     { id: 'sync-now', label: 'Sync analytics now', icon: 'refresh', group: 'Actions', run: async () => {
       try { await api.analyticsSyncNow(); onToast('Analytics sync started', 'success'); } catch (e) { onToast('Sync failed: ' + e.message, 'error'); }
     }},
-    { id: 'rotate', label: 'Rotate setup token', icon: 'rotate', group: 'Actions', run: async () => {
-      try { await api.rotateToken(); await reloadConfig(); onToast('Setup token rotated', 'success'); } catch (e) { onToast('Rotate failed: ' + e.message, 'error'); }
+    { id: 'rotate', label: 'Rotate setup token', icon: 'rotate', group: 'Actions', run: () => {
+      setCmdOpen(false);
+      requestRotateToken();
     }},
     { id: 'vacuum', label: 'Reclaim database space (VACUUM)', icon: 'trash', group: 'Actions', run: async () => {
       if (!confirm('Run VACUUM on the database?')) return;
       try { await api.databaseVacuum(); onToast('VACUUM finished', 'success'); } catch (e) { onToast('VACUUM failed: ' + e.message, 'error'); }
     }},
     { id: 'export', label: 'Export companion config', icon: 'download', group: 'Actions', run: () => { window.location.href = api.exportConfigUrl(); }},
-  ], [onToast, reloadConfig]);
+  ], [onToast, requestRotateToken]);
 
   if (authState === 'checking') {
     return (
@@ -202,10 +255,32 @@ export default function App() {
     );
   }
 
-  if (authState === 'needs-login') {
+  if (authState === 'host-rejected') {
+    return (
+      <div className="login-stage">
+        <div className="login-card" style={{ maxWidth: 460 }}>
+          <div className="eyebrow" style={{ color: 'var(--err)' }}>Access Blocked (403 host_rejected)</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--t-0)', marginTop: 6 }}>
+            Invalid Host header for loopback access
+          </div>
+          <div className="muted" style={{ fontSize: 12.5, marginTop: 10, lineHeight: 1.55 }}>
+            SpatialFin Companion rejected this request because the <span className="mono">Host</span> header does not match a direct loopback address (<span className="mono">localhost</span>, <span className="mono">127.0.0.1</span>, or <span className="mono">[::1]</span>).
+            If you are accessing Companion through a reverse proxy, set <span className="mono">COMPANION_TRUST_PROXY=1</span> and configure an admin password via <span className="mono">COMPANION_ADMIN_PASSWORD</span>.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (authState === 'needs-login' || authState === 'needs-bootstrap') {
     return (
       <Login
+        mode={authState}
+        canBootstrapWithPin={bootstrapMeta.canBootstrapWithPin}
+        bootstrapPinExpiresAt={bootstrapMeta.bootstrapPinExpiresAt}
         onSubmit={login}
+        onBootstrap={bootstrap}
+        onRetryBootstrapCheck={checkAuth}
         version={meta?.version}
         hostLabel={typeof window !== 'undefined' ? window.location.host : ''}
       />
@@ -249,8 +324,34 @@ export default function App() {
         />
       )}
 
+      {rotateConfirmOpen && (
+        <Modal
+          title="Rotate setup token?"
+          eyebrow="Security"
+          width={460}
+          onClose={() => !rotatingToken && setRotateConfirmOpen(false)}
+          footer={
+            <>
+              <button type="button" className="btn" onClick={() => setRotateConfirmOpen(false)} disabled={rotatingToken}>
+                Cancel
+              </button>
+              <button type="button" className="btn danger" onClick={confirmRotateToken} disabled={rotatingToken}>
+                {rotatingToken ? 'Rotating…' : 'Rotate token'}
+              </button>
+            </>
+          }
+        >
+          <div style={{ fontSize: 13, color: 'var(--t-1)', lineHeight: 1.55 }}>
+            Rotating the setup token immediately revokes active Companion sync connections and FCast tickets.
+            <strong> All currently paired headsets, phones, TVs, and WebXR browsers will need to re-pair</strong> using the new QR code or setup token.
+          </div>
+        </Modal>
+      )}
+
       {toast && (
         <div
+          role="status"
+          aria-live="polite"
           style={{
             position: 'fixed',
             bottom: 18,

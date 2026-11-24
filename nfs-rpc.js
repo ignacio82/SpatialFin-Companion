@@ -1,4 +1,7 @@
 const net = require('net');
+const { validateLanHost } = require('./safe-fetch');
+
+const MAX_RPC_TCP_BYTES = 1024 * 1024;
 
 const AUTH_NULL = 0;
 const IPPROTO_TCP = 6;
@@ -142,6 +145,7 @@ function sendRpcTcpRequest(host, port, program, version, procedure, body, timeou
     }, timeoutMs);
 
     let pending = Buffer.alloc(0);
+    let accumulatedBytes = 0;
     const fragments = [];
 
     function finish(error, value) {
@@ -161,11 +165,20 @@ function sendRpcTcpRequest(host, port, program, version, procedure, body, timeou
     });
 
     socket.on('data', (chunk) => {
+      accumulatedBytes += chunk.length;
+      if (accumulatedBytes > MAX_RPC_TCP_BYTES) {
+        finish(new Error('RPC response exceeded 1 MiB safety limit.'));
+        return;
+      }
       pending = Buffer.concat([pending, chunk]);
       while (pending.length >= 4) {
         const header = pending.readUInt32BE(0);
         const isLastFragment = (header & 0x80000000) !== 0;
         const length = header & 0x7fffffff;
+        if (length > MAX_RPC_TCP_BYTES) {
+          finish(new Error('RPC fragment length exceeded 1 MiB safety limit.'));
+          return;
+        }
         if (pending.length < 4 + length) {
           return;
         }
@@ -231,14 +244,16 @@ function parseMountExports(reply) {
   return exports;
 }
 
-async function queryNfsExportsViaRpc(host, timeoutMs = 5000) {
-  const mountdPort = await queryRpcPort(host, MOUNTPROG, MOUNTVERS, IPPROTO_TCP, timeoutMs);
-  if (!mountdPort) {
-    throw new Error('Mount daemon is not registered with portmapper on the target host.');
+async function queryNfsExportsViaRpc(host, timeoutMs = 5000, options = {}) {
+  const pinned = options.pinnedHost || (await validateLanHost(host, options));
+  const targetIp = pinned.address;
+  const mountdPort = await queryRpcPort(targetIp, MOUNTPROG, MOUNTVERS, IPPROTO_TCP, timeoutMs);
+  if (!Number.isInteger(mountdPort) || mountdPort < 1 || mountdPort > 65535) {
+    throw new Error('Mount daemon is not registered with a valid port on the target host.');
   }
 
   const reply = await sendRpcTcpRequest(
-    host,
+    targetIp,
     mountdPort,
     MOUNTPROG,
     MOUNTVERS,

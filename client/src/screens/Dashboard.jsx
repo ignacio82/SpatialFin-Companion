@@ -9,7 +9,7 @@ import { api } from '../api.js';
 import { useWebSocketEvent } from '../ws.js';
 import { fmtBytes, fmtMinutes, ago, shortAgo, fmtTime } from '../format.js';
 
-export default function Dashboard({ config, version, onNavigate, onToast }) {
+export default function Dashboard({ config, version, onNavigate, onToast, onRequestRotateToken }) {
   const [tokenVisible, setTokenVisible] = useState(false);
   const [qrFullscreen, setQrFullscreen] = useState(false);
   const [tvPairOpen, setTvPairOpen] = useState(false);
@@ -36,18 +36,28 @@ export default function Dashboard({ config, version, onNavigate, onToast }) {
     }
   }, []);
 
+  const reloadQr = useCallback(() => {
+    api.getQr().then(setQr).catch(() => {});
+  }, []);
+
   useEffect(() => {
-    api.getQr(window.location.hostname).then(setQr).catch(() => {});
+    reloadQr();
     api.syncLog().then((d) => setHistory(Array.isArray(d) ? d : (d?.entries || []))).catch(() => setHistory([]));
     api.databaseStats().then(setDbStats).catch(() => {});
     api.deviceLogs().then((d) => setDevices(Array.isArray(d?.devices) ? d.devices : (Array.isArray(d) ? d : []))).catch(() => {});
     reloadAnalytics();
-  }, [reloadAnalytics]);
+  }, [reloadAnalytics, reloadQr]);
 
   useWebSocketEvent('analytics_sessions_ingested', reloadAnalytics);
   useWebSocketEvent('analytics_sync_completed', reloadAnalytics);
+  useWebSocketEvent('config_changed', reloadQr);
 
-  const setupToken = config?.setup_token || '';
+  const setupToken = qr?.setup_token || '';
+  const displayedQrPayload = useMemo(() => {
+    if (!qr?.payload) return 'Loading QR payload…';
+    if (tokenVisible || !setupToken) return qr.payload;
+    return qr.payload.split(setupToken).join('••••••••••••');
+  }, [qr?.payload, tokenVisible, setupToken]);
   const sparkSessions = useMemo(() => {
     if (!trend.length) return [0, 0];
     return trend.map((d) => Number(d.sessions || d.sessionCount || 0));
@@ -59,7 +69,11 @@ export default function Dashboard({ config, version, onNavigate, onToast }) {
 
   const serverList = Array.isArray(config?.servers) ? config.servers : [];
   const verifiedUsers = serverList.reduce(
-    (acc, s) => acc + (Array.isArray(s.users) ? s.users.filter((u) => u && u.access_token).length : 0),
+    (acc, s) =>
+      acc +
+      (Array.isArray(s.users)
+        ? s.users.filter((u) => u && Boolean(u.has_verified_token || (u.access_token && u.access_token !== '***REDACTED***'))).length
+        : 0),
     0
   );
   const onlineServers = serverList.filter((s) => s && s.online !== false).length;
@@ -69,13 +83,8 @@ export default function Dashboard({ config, version, onNavigate, onToast }) {
   const liveSockets = realtimeSockets.filter((s) => (s.state || s.status) === 'connected' || s.connected === true).length;
   const totalSockets = realtimeSockets.length;
 
-  async function rotateToken() {
-    try {
-      await api.rotateToken();
-      onToast?.('Setup token rotated', 'success');
-    } catch (e) {
-      onToast?.('Failed to rotate token: ' + e.message, 'error');
-    }
+  function rotateToken() {
+    onRequestRotateToken?.();
   }
 
   async function copyToken() {
@@ -94,6 +103,27 @@ export default function Dashboard({ config, version, onNavigate, onToast }) {
 
   return (
     <div className="col" style={{ gap: 14 }} data-screen-label="01 Dashboard">
+
+      {config?.setupTokenWeak && (
+        <div className="card" style={{ borderColor: 'rgba(255,181,71,0.45)', background: 'rgba(255,181,71,0.08)' }}>
+          <div className="row between wrap" style={{ gap: 10 }}>
+            <div style={{ fontSize: 12.5, color: 'var(--t-0)' }}>
+              <strong>Legacy weak setup token detected.</strong> Rotate to a 128-bit cryptographic token once your devices are ready to re-pair.
+            </div>
+            <button type="button" className="btn sm primary" onClick={rotateToken}>
+              <Icon name="rotate" size={13}/> Rotate token…
+            </button>
+          </div>
+        </div>
+      )}
+
+      {config?.preStage1BackupPresent && (
+        <div className="card" style={{ borderColor: 'rgba(0,164,220,0.35)' }}>
+          <div style={{ fontSize: 12, color: 'var(--t-2)' }}>
+            Pre-upgrade backup <span className="mono">data/companion.sqlite.pre-stage1.bak</span> is present (auto-deleted after 14 days). Once you have verified device sync, you may remove it early.
+          </div>
+        </div>
+      )}
 
       {/* ── Hero ────────────────────────────────────────────────────────── */}
       <div className="hero">
@@ -188,7 +218,7 @@ export default function Dashboard({ config, version, onNavigate, onToast }) {
                 wordBreak: 'break-all',
               }}
             >
-              {qr?.payload || 'spatialfin://pair?…'}
+              {displayedQrPayload}
             </div>
           </div>
 
@@ -204,7 +234,7 @@ export default function Dashboard({ config, version, onNavigate, onToast }) {
               </button>
               <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
                 <button className="btn" style={{ flex: 1, minWidth: 120 }} onClick={() => setTvPairOpen(true)}>
-                  <Icon name="tv" size={14}/> Pair TV
+                  <Icon name="tv" size={14}/> Set up a device
                 </button>
                 <button className="btn" style={{ flex: 1, minWidth: 120 }} onClick={() => onNavigate?.('servers')}>
                   <Icon name="server" size={14}/> Servers
@@ -459,7 +489,7 @@ export default function Dashboard({ config, version, onNavigate, onToast }) {
               <QrPaper dataUrl={qr?.qr || qr?.dataUrl}/>
             </div>
             <div className="mono" style={{ fontSize: 11, color: 'var(--t-3)', textAlign: 'center', wordBreak: 'break-all' }}>
-              {qr?.payload}
+              {displayedQrPayload}
             </div>
             <div className="row" style={{ gap: 8 }}>
               <button className="btn" onClick={() => setQrFullscreen(false)}>Close</button>
@@ -470,6 +500,7 @@ export default function Dashboard({ config, version, onNavigate, onToast }) {
 
       {tvPairOpen && (
         <TvPairingModal
+          config={config}
           onClose={() => setTvPairOpen(false)}
           onToast={onToast}
         />

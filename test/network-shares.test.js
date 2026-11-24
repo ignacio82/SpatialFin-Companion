@@ -131,3 +131,39 @@ test('isPathWithinExport rejects traversal segments', () => {
   assert.equal(isPathWithinExport('/srv/..', '/srv'), false);
   assert.equal(isPathWithinExport('/srv/media/../../secret', '/srv/media'), false);
 });
+
+test('normalizeNetworkShare parses bracketed IPv6 host and optional port', () => {
+  const withPort = normalizeNetworkShare({
+    protocol: 'smb',
+    host: '[fd00::1]:445',
+    shareName: 'media'
+  });
+  assert.equal(withPort.host, 'fd00::1');
+  assert.equal(withPort.port, 445);
+
+  const portless = normalizeNetworkShare({
+    protocol: 'nfs',
+    host: '[fd00::1]',
+    shareName: '/srv/media'
+  });
+  assert.equal(portless.host, 'fd00::1');
+  assert.equal(portless.port, null);
+});
+
+test('normalizeNetworkShare centralizes path -> { shareName, path } fallback for SMB and NFS', () => {
+  const smb = normalizeNetworkShare({
+    protocol: 'smb',
+    host: '192.168.1.10',
+    path: '/Movies/Anime/Series'
+  });
+  assert.equal(smb.shareName, 'Movies');
+  assert.equal(smb.path, 'Anime\\Series');
+
+  const nfs = normalizeNetworkShare({
+    protocol: 'nfs',
+    host: '192.168.1.20',
+    path: '/srv/exports/media'
+  });
+  assert.equal(nfs.shareName, '/srv/exports/media');
+  assert.equal(nfs.path, '');
+});

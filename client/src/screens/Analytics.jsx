@@ -106,7 +106,7 @@ export default function Analytics({ onToast }) {
   async function prunePlayback() {
     if (!confirm(`Prune playback older than ${pruneDays} days?`)) return;
     try {
-      await api.pruneAnalytics({ days: Number(pruneDays) });
+      await api.pruneAnalytics({ olderThanDays: Number(pruneDays) });
       onToast?.('Playback pruned', 'success');
       load();
       api.databaseStats().then(setDbStats).catch(() => {});

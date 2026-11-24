@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import Icon from '../components/Icon.jsx';
 import Toggle from '../components/Toggle.jsx';
+import Modal from '../components/Modal.jsx';
 import { api } from '../api.js';
 
 const toBool = (v) => v === 'true' || v === true;
@@ -8,23 +9,51 @@ const fromBool = (v) => (v ? 'true' : 'false');
 
 export default function Services({ config, reloadConfig, onToast }) {
   const [draft, setDraft] = useState(() => ({ ...(config?.globalPreferences || {}) }));
+  const [draftBaseVersion, setDraftBaseVersion] = useState(() => config?.configVersion ?? null);
+  const [dirty, setDirty] = useState(false);
+  const [conflict, setConflict] = useState(false);
+  const [dropPrompt, setDropPrompt] = useState(null);
   const [busy, setBusy] = useState(false);
   const [tests, setTests] = useState({});
 
   useEffect(() => {
-    setDraft({ ...(config?.globalPreferences || {}) });
-  }, [config]);
+    if (!dirty) {
+      setDraft({ ...(config?.globalPreferences || {}) });
+      setDraftBaseVersion(config?.configVersion ?? null);
+    }
+  }, [config, dirty]);
 
-  const set = (k, v) => setDraft((d) => ({ ...d, [k]: v }));
+  const set = (k, v) => {
+    setDirty(true);
+    setDraft((d) => {
+      const next = { ...d, [k]: v };
+      if (k === 'pref_seerr_url' && d.pref_seerr_api_key === '***REDACTED***') {
+        next.pref_seerr_api_key = '';
+      }
+      return next;
+    });
+  };
 
-  async function save() {
+  async function save(confirmDropUnmatchedSecrets = false) {
     setBusy(true);
+    setConflict(false);
     try {
-      await api.setConfig({ ...config, globalPreferences: draft });
+      const payload = { globalPreferences: draft };
+      if (confirmDropUnmatchedSecrets) payload.confirmDropUnmatchedSecrets = true;
+      await api.setConfig(payload, draftBaseVersion);
+      setDirty(false);
+      setDropPrompt(null);
       await reloadConfig?.();
       onToast?.('Services saved', 'success');
     } catch (e) {
-      onToast?.('Save failed: ' + e.message, 'error');
+      if (e?.status === 409) {
+        setConflict(true);
+        onToast?.('Configuration changed in another session — reload latest', 'warning');
+      } else if (e?.status === 400 && e?.errorCode === 'redacted_secret_mismatch') {
+        setDropPrompt(e?.payload?.unmatchedSecrets || ['pref_seerr_api_key']);
+      } else {
+        onToast?.('Save failed: ' + e.message, 'error');
+      }
     } finally {
       setBusy(false);
     }
@@ -34,7 +63,7 @@ export default function Services({ config, reloadConfig, onToast }) {
     setTests((t) => ({ ...t, seerr: 'testing' }));
     try {
       const res = await api.testSeerr({
-        seerrUrl: draft.pref_seerr_url,
+        url: draft.pref_seerr_url,
         apiKey: draft.pref_seerr_api_key,
       });
       setTests((t) => ({ ...t, seerr: res.success ? 'ok' : 'err' }));
@@ -45,8 +74,25 @@ export default function Services({ config, reloadConfig, onToast }) {
     }
   }
 
+  async function reloadLatest() {
+    setConflict(false);
+    const latest = await reloadConfig?.();
+    setDraft({ ...((latest || config)?.globalPreferences || {}) });
+    setDraftBaseVersion((latest || config)?.configVersion ?? null);
+    setDirty(false);
+  }
+
   return (
     <div className="col" style={{ gap: 14 }} data-screen-label="04 External Services">
+      {conflict && (
+        <div className="card" style={{ borderColor: 'rgba(255,181,71,0.5)' }}>
+          <div className="row between wrap" style={{ gap: 8 }}>
+            <span style={{ fontSize: 12.5 }}>Configuration changed in another session. Your unsaved edits are still preserved below.</span>
+            <button type="button" className="btn sm primary" onClick={reloadLatest}>Reload latest</button>
+          </div>
+        </div>
+      )}
+
       <ServiceCard
         title="Seerr"
         subtitle="Overseerr / Jellyseerr requests"
@@ -63,7 +109,7 @@ export default function Services({ config, reloadConfig, onToast }) {
           <Toggle on={toBool(draft.pref_seerr_enabled)} onChange={(v) => set('pref_seerr_enabled', fromBool(v))}/>
         </Row>
         <div className="row" style={{ justifyContent: 'flex-end', gap: 8, marginTop: 8 }}>
-          <button className="btn sm" onClick={testSeerr}>Test Connection</button>
+          <button type="button" className="btn sm" onClick={testSeerr}>Test Connection</button>
         </div>
       </ServiceCard>
 
@@ -115,10 +161,31 @@ export default function Services({ config, reloadConfig, onToast }) {
       </ServiceCard>
 
       <div className="row" style={{ justifyContent: 'flex-end', gap: 8 }}>
-        <button className="btn primary" disabled={busy} onClick={save}>
+        <button type="button" className="btn primary" disabled={busy} onClick={() => save(false)}>
           <Icon name="check" size={13}/> {busy ? 'Saving…' : 'Save Services'}
         </button>
       </div>
+
+      {dropPrompt && (
+        <Modal
+          title="Clear unmatched stored secrets?"
+          eyebrow="Target changed"
+          width={480}
+          onClose={() => setDropPrompt(null)}
+          footer={
+            <>
+              <button type="button" className="btn" onClick={() => setDropPrompt(null)}>Cancel</button>
+              <button type="button" className="btn danger" disabled={busy} onClick={() => save(true)}>
+                Drop unmatched secrets &amp; save
+              </button>
+            </>
+          }
+        >
+          <div style={{ fontSize: 13, color: 'var(--t-1)', lineHeight: 1.55 }}>
+            Changing the Seerr URL invalidates previously stored Seerr API keys ({dropPrompt.join(', ')}). Confirm to drop them and save.
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }

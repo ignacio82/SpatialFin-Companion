@@ -1,9 +1,55 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('node:crypto');
+const net = require('node:net');
+const { Worker } = require('node:worker_threads');
 const { DatabaseSync } = require('node:sqlite');
+const { normalizeNetworkShare } = require('./network-shares');
+const { LOCAL_ONLY_PREF_KEYS, FORBIDDEN_KEYS } = require('./config-redaction');
+const {
+  stripBrackets,
+  normalizeHostForMatch,
+  effectivePortForUrl,
+  isLoopbackIp,
+  isSyntacticLoopbackHost,
+} = require('./safe-fetch');
 
 const DEFAULT_MAX_LOG_ENTRIES_PER_DEVICE = 5000;
 const DEFAULT_MAX_LOG_MESSAGE_LENGTH = 4000;
+const STRONG_SETUP_TOKEN_REGEX = /^sf-setup-[0-9a-f]{32,}$/;
+
+function generateSetupToken() {
+  return `sf-setup-${crypto.randomBytes(16).toString('hex')}`;
+}
+
+function isSetupTokenWeakValue(token) {
+  return !STRONG_SETUP_TOKEN_REGEX.test(String(token || ''));
+}
+
+function sha256Hex(value) {
+  return crypto.createHash('sha256').update(String(value || '')).digest('hex');
+}
+
+function guardedChmod(targetPath, mode) {
+  try {
+    fs.chmodSync(targetPath, mode);
+  } catch (err) {
+    if (err && (err.code === 'EPERM' || err.code === 'ENOTSUP' || err.code === 'EROFS')) {
+      console.warn(`[storage] chmod ${mode.toString(8)} skipped on ${targetPath}: ${err.code}`);
+    }
+  }
+}
+
+function assertNotSymlink(destPath) {
+  try {
+    const stat = fs.lstatSync(destPath);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Refusing VACUUM INTO symlink destination: ${destPath}`);
+    }
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') throw err;
+  }
+}
 
 function createStorage(options) {
   const {
@@ -15,13 +61,19 @@ function createStorage(options) {
   } = options;
 
   const dataDir = path.join(rootDir, 'data');
+  const backupsDir = path.join(dataDir, 'backups');
   const dbFile = path.join(dataDir, 'companion.sqlite');
+  const preStage1BackupPath = path.join(dataDir, 'companion.sqlite.pre-stage1.bak');
   const legacyConfigFile = path.join(rootDir, 'config.json');
   const legacyDeviceLogsFile = path.join(dataDir, 'device-logs.json');
 
-  ensureDir(dataDir);
+  ensureDir(dataDir, 0o700);
+  ensureDir(backupsDir, 0o700);
 
+  const existedBeforeOpen = fs.existsSync(dbFile);
   const db = new DatabaseSync(dbFile);
+  guardedChmod(dbFile, 0o600);
+  db.exec('PRAGMA busy_timeout = 250');
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA foreign_keys = ON');
 
@@ -33,6 +85,11 @@ function createStorage(options) {
       VALUES (?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
     `),
+    setStateIfUnset: db.prepare(`
+      INSERT OR IGNORE INTO app_state (key, value, updated_at)
+      VALUES (?, ?, ?)
+    `),
+    deleteState: db.prepare('DELETE FROM app_state WHERE key = ?'),
     insertSnapshot: db.prepare(`
       INSERT INTO config_snapshots (created_at, reason, config_json)
       VALUES (?, ?, ?)
@@ -47,6 +104,12 @@ function createStorage(options) {
       WHERE type = 'device_sync_pull'
       ORDER BY id DESC
       LIMIT ?
+    `),
+    syncEventsSince: db.prepare(`
+      SELECT created_at, details_json
+      FROM events
+      WHERE type = 'device_sync_pull' AND created_at >= ?
+      ORDER BY id ASC
     `),
     upsertDevice: db.prepare(`
       INSERT INTO devices (
@@ -64,6 +127,16 @@ function createStorage(options) {
         latest_entry_at = excluded.latest_entry_at,
         entry_count = excluded.entry_count,
         last_ip = excluded.last_ip
+    `),
+    upsertDeviceMeta: db.prepare(`
+      INSERT INTO devices (
+        device_id, device_name, app_version, first_seen_at, last_seen_at, entry_count, last_ip
+      ) VALUES (?, ?, ?, ?, ?, 0, ?)
+      ON CONFLICT(device_id) DO UPDATE SET
+        device_name = COALESCE(NULLIF(excluded.device_name, ''), devices.device_name),
+        app_version = COALESCE(NULLIF(excluded.app_version, ''), devices.app_version),
+        last_seen_at = excluded.last_seen_at,
+        last_ip = COALESCE(excluded.last_ip, devices.last_ip)
     `),
     insertDeviceLog: db.prepare(`
       INSERT INTO device_logs (device_id, timestamp, received_at, level, tag, message, stack)
@@ -122,7 +195,7 @@ function createStorage(options) {
     deleteAllPlaybackSessions: db.prepare('DELETE FROM playback_sessions'),
     deleteAllPlaybackSessionEvents: db.prepare('DELETE FROM playback_session_events'),
     deletePlaybackSessionsOlderThan: db.prepare('DELETE FROM playback_sessions WHERE COALESCE(last_seen_at, started_at) < ?'),
-    deleteEventsOlderThan: db.prepare('DELETE FROM events WHERE created_at < ?'),
+    deleteEventsOlderThan: db.prepare("DELETE FROM events WHERE created_at < ? AND (type != 'device_sync_pull' OR created_at < ?)"),
     deleteDeviceLogsOlderThan: db.prepare('DELETE FROM device_logs WHERE received_at < ?'),
     refreshDeviceEntryCounts: db.prepare(`
       UPDATE devices
@@ -133,6 +206,7 @@ function createStorage(options) {
     resetDeviceLogCount: db.prepare('UPDATE devices SET entry_count = 0, latest_entry_at = NULL WHERE device_id = ?'),
     createSession: db.prepare('INSERT INTO admin_sessions (token, created_at, expires_at, last_used_at) VALUES (?, ?, ?, ?)'),
     getSession: db.prepare('SELECT token, expires_at AS expiresAt FROM admin_sessions WHERE token = ?'),
+    getAllActiveSessions: db.prepare('SELECT token, expires_at AS expiresAt FROM admin_sessions WHERE expires_at IS NULL OR expires_at > ?'),
     deleteSession: db.prepare('DELETE FROM admin_sessions WHERE token = ?'),
     touchSession: db.prepare('UPDATE admin_sessions SET last_used_at = ? WHERE token = ?'),
     pruneExpiredSessions: db.prepare('DELETE FROM admin_sessions WHERE expires_at IS NOT NULL AND expires_at <= ?'),
@@ -510,26 +584,69 @@ function createStorage(options) {
     `)
   };
 
-  migrateLegacyState();
+  const { migratedFromLegacyConfig } = migrateLegacyState();
+  const isUpgradedDb = existedBeforeOpen || migratedFromLegacyConfig;
+
+  // Initialize immutable instance_id, stage1_telemetry_started_at, config_version, and loopback seed
+  const initNow = isoNow();
+  statements.setStateIfUnset.run('instance_id', crypto.randomBytes(8).toString('hex'), initNow);
+  statements.setStateIfUnset.run('stage1_telemetry_started_at', initNow, initNow);
+  statements.setStateIfUnset.run('config_version', '1', initNow);
+
+  if (!isUpgradedDb) {
+    statements.setStateIfUnset.run('stage1_pre_backup_done', '1', initNow);
+    statements.setStateIfUnset.run('stage1_live_vacuum_done', '1', initNow);
+    statements.setStateIfUnset.run('stage1_backups_scrubbed', '1', initNow);
+  }
+  seedLoopbackAllowlistOnce(isUpgradedDb, initNow);
+
+  // In-memory caches served during vacuumInFlight with zero SQLite statements
+  let cachedInstanceId = statements.getState.get('instance_id')?.value || crypto.randomBytes(8).toString('hex');
+  let cachedConfigVersion = Math.max(1, Number(statements.getState.get('config_version')?.value) || 1);
+  let cachedAdminPasswordHash = statements.getState.get('admin_password_hash')?.value || null;
+  const cachedTelemetryStartedAt = statements.getState.get('stage1_telemetry_started_at')?.value || initNow;
+
+  let vacuumInFlight = false;
+  const adminSessionSnapshot = new Map();
+  let workerQueue = Promise.resolve();
+  let activeWorker = null;
+  let closed = false;
 
   return {
     dbFile,
+    dataDir,
+    backupsDir,
+    preStage1BackupPath,
+    isUpgradedDb,
     getConfig,
     saveConfig,
+    saveConfigAndMigrateServerIds,
+    normalizeConfig,
+    getConfigVersion,
+    getInstanceId,
+    getAdminPasswordHash,
+    setAdminPasswordHashIfUnset,
+    isSetupTokenWeak,
+    getConfigPullStats,
+    getStateValue,
+    setStateValue,
+    deleteStateValue,
     recordEvent,
     getSyncLog,
     getDeviceSummaries,
     getDeviceWithLogs,
+    upsertDevice,
     upsertDeviceLogs,
     clearDeviceLogs,
     renameDevice,
     deleteDevice,
     createAdminSession,
     validateAdminSession,
+    isAdminSessionValid,
     deleteAdminSession,
     pruneExpiredAdminSessions,
     getConfigSnapshots,
-    restoreConfigSnapshot,
+    getConfigSnapshot,
     upsertPlaybackSessions,
     getAnalyticsOverview,
     getRecentPlaybackSessions,
@@ -550,7 +667,19 @@ function createStorage(options) {
     prunePlaybackSessionsOlderThan,
     pruneDeviceLogsOlderThan,
     getDatabaseStats,
-    vacuumDatabase
+    vacuumDatabase,
+    vacuumInto,
+    isVacuumInFlight,
+    enterVacuumInFlight,
+    exitVacuumInFlight,
+    runWorkerTask,
+    runStage1UpgradeInWorker,
+    runVacuumInWorker,
+    runBackupInWorker,
+    runScrubHistoricalBackupsInWorker,
+    hasPreStage1Backup,
+    prunePreStage1Backup,
+    close
   };
 
   function initSchema() {
@@ -689,7 +818,7 @@ function createStorage(options) {
 
   function migrateLegacyState() {
     if (statements.getState.get('config')) {
-      return;
+      return { migratedFromLegacyConfig: false };
     }
 
     const now = isoNow();
@@ -729,6 +858,79 @@ function createStorage(options) {
         console.error('Failed to migrate legacy device logs:', error);
       }
     }
+
+    return { migratedFromLegacyConfig };
+  }
+
+  function seedLoopbackAllowlistOnce(upgraded, now) {
+    if (statements.getState.get('stage1_loopback_seed_done')?.value === '1') {
+      return;
+    }
+    const allowlist = new Set();
+    const pendingCandidates = new Set();
+
+    if (upgraded) {
+      const row = statements.getState.get('config');
+      const parsed = row && row.value ? safeParseJson(row.value) : null;
+      const urls = [];
+      if (parsed && typeof parsed === 'object') {
+        if (Array.isArray(parsed.servers)) {
+          for (const srv of parsed.servers) {
+            if (Array.isArray(srv?.addresses)) {
+              for (const addr of srv.addresses) urls.push(addr);
+            }
+            if (Array.isArray(srv?.users)) {
+              for (const u of srv.users) {
+                if (u?.preferences?.pref_seerr_url) urls.push(u.preferences.pref_seerr_url);
+              }
+            }
+          }
+        }
+        if (parsed.globalPreferences?.pref_seerr_url) {
+          urls.push(parsed.globalPreferences.pref_seerr_url);
+        }
+        if (parsed.devicePreferences && typeof parsed.devicePreferences === 'object') {
+          for (const map of Object.values(parsed.devicePreferences)) {
+            if (map?.pref_seerr_url) urls.push(map.pref_seerr_url);
+          }
+        }
+      }
+
+      for (const rawUrl of urls) {
+        if (typeof rawUrl !== 'string' || !rawUrl.trim()) continue;
+        try {
+          const u = new URL(rawUrl.trim());
+          if (u.protocol !== 'http:' && u.protocol !== 'https:') continue;
+          const host = normalizeHostForMatch(u.hostname);
+          const port = effectivePortForUrl(u);
+          if (!host || !port) continue;
+          const key = `${host}:${port}`;
+          const cleanIp = stripBrackets(u.hostname);
+          if (net.isIP(cleanIp)) {
+            if (isLoopbackIp(cleanIp)) {
+              allowlist.add(key);
+            }
+          } else if (isSyntacticLoopbackHost(host)) {
+            allowlist.add(key);
+          } else {
+            pendingCandidates.add(key);
+          }
+        } catch (_) {}
+      }
+
+      if (allowlist.size > 0) {
+        statements.upsertState.run('legacy_loopback_upstreams_allowlist', JSON.stringify(Array.from(allowlist)), now);
+      }
+      if (pendingCandidates.size > 0) {
+        statements.upsertState.run(
+          'stage1_pending_loopback_dns_candidates',
+          JSON.stringify(Array.from(pendingCandidates)),
+          now
+        );
+      }
+    }
+
+    statements.upsertState.run('stage1_loopback_seed_done', '1', now);
   }
 
   function createDefaultConfig() {
@@ -738,8 +940,24 @@ function createStorage(options) {
       devicePreferences: {},
       servers: [],
       networkShares: [],
-      setup_token: 'sf-setup-' + Math.random().toString(36).substr(2, 9)
+      setup_token: generateSetupToken()
     });
+  }
+
+  function sanitizePreferenceMap(rawPrefs, { preserveNull = false } = {}) {
+    const clean = {};
+    if (!rawPrefs || typeof rawPrefs !== 'object' || Array.isArray(rawPrefs)) return clean;
+    for (const [k, v] of Object.entries(rawPrefs)) {
+      if (typeof k !== 'string' || k.length === 0 || FORBIDDEN_KEYS.has(k)) continue;
+      if (LOCAL_ONLY_PREF_KEYS.has(k)) continue;
+      if (v === null) {
+        if (preserveNull) clean[k] = null;
+        continue;
+      }
+      if (typeof v === 'string') clean[k] = v;
+      else if (typeof v === 'boolean' || typeof v === 'number') clean[k] = String(v);
+    }
+    return clean;
   }
 
   // Per-user Music Assistant config + universal-plugin manifest URLs ride on the
@@ -749,41 +967,50 @@ function createStorage(options) {
     if (!Array.isArray(rawServers)) return [];
     return rawServers.map((server) => {
       if (!server || typeof server !== 'object' || Array.isArray(server)) return server;
-      if (!Array.isArray(server.users)) return server;
-      return {
-        ...server,
-        users: server.users.map((user) => {
-          if (!user || typeof user !== 'object' || Array.isArray(user)) return user;
-          const next = { ...user };
-          // musicAssistant: { url, token?, username? } — drop unless url is set.
-          const ma = user.musicAssistant;
-          if (ma && typeof ma === 'object' && !Array.isArray(ma) && typeof ma.url === 'string' && ma.url.trim()) {
-            const cleanMa = { url: ma.url.trim() };
-            if (typeof ma.token === 'string' && ma.token) cleanMa.token = ma.token;
-            if (typeof ma.username === 'string' && ma.username) cleanMa.username = ma.username;
-            if (typeof ma.password === 'string' && ma.password) cleanMa.password = ma.password;
-            next.musicAssistant = cleanMa;
-          } else {
-            delete next.musicAssistant;
+      const nextServer = { ...server };
+      if (!Array.isArray(server.users)) return nextServer;
+      nextServer.users = server.users.map((user) => {
+        if (!user || typeof user !== 'object' || Array.isArray(user)) return user;
+        const next = { ...user };
+        delete next.password;
+        delete next.has_verified_token;
+        next.needs_relink = Boolean(user.needs_relink);
+
+        if (user.preferences && typeof user.preferences === 'object' && !Array.isArray(user.preferences)) {
+          next.preferences = sanitizePreferenceMap(user.preferences, { preserveNull: false });
+        } else {
+          next.preferences = {};
+        }
+
+        // musicAssistant: { url, token?, username?, password? } — drop unless url is set.
+        const ma = user.musicAssistant;
+        if (ma && typeof ma === 'object' && !Array.isArray(ma) && typeof ma.url === 'string' && ma.url.trim()) {
+          const cleanMa = { url: ma.url.trim() };
+          if (typeof ma.token === 'string' && ma.token) cleanMa.token = ma.token;
+          if (typeof ma.username === 'string' && ma.username) cleanMa.username = ma.username;
+          if (typeof ma.password === 'string' && ma.password) cleanMa.password = ma.password;
+          next.musicAssistant = cleanMa;
+        } else {
+          delete next.musicAssistant;
+        }
+        // plugins: deduped list of manifest-URL strings.
+        if (Array.isArray(user.plugins)) {
+          const seen = new Set();
+          const plugins = [];
+          for (const entry of user.plugins) {
+            if (typeof entry !== 'string') continue;
+            const url = entry.trim();
+            if (!url || seen.has(url)) continue;
+            seen.add(url);
+            plugins.push(url);
           }
-          // plugins: deduped list of manifest-URL strings.
-          if (Array.isArray(user.plugins)) {
-            const seen = new Set();
-            const plugins = [];
-            for (const entry of user.plugins) {
-              if (typeof entry !== 'string') continue;
-              const url = entry.trim();
-              if (!url || seen.has(url)) continue;
-              seen.add(url);
-              plugins.push(url);
-            }
-            next.plugins = plugins;
-          } else {
-            delete next.plugins;
-          }
-          return next;
-        }),
-      };
+          next.plugins = plugins;
+        } else {
+          delete next.plugins;
+        }
+        return next;
+      });
+      return nextServer;
     });
   }
 
@@ -796,29 +1023,36 @@ function createStorage(options) {
       : {};
     const devicePreferences = {};
     for (const [deviceId, overrides] of Object.entries(rawDevicePrefs)) {
-      if (!deviceId || typeof deviceId !== 'string') continue;
+      if (!deviceId || typeof deviceId !== 'string' || FORBIDDEN_KEYS.has(deviceId)) continue;
+      if (deviceId.length > 128) continue;
       if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) continue;
-      const clean = {};
-      for (const [k, v] of Object.entries(overrides)) {
-        if (typeof k !== 'string' || k.length === 0) continue;
-        if (v === null) { clean[k] = null; continue; }
-        if (typeof v === 'string') clean[k] = v;
-        else if (typeof v === 'boolean' || typeof v === 'number') clean[k] = String(v);
-      }
+      const clean = sanitizePreferenceMap(overrides, { preserveNull: true });
       if (Object.keys(clean).length > 0) devicePreferences[deviceId] = clean;
     }
+
+    const baseGlobal = sanitizePreferenceMap(defaultPreferences, { preserveNull: true });
+    const incomingGlobal = sanitizePreferenceMap(
+      config.globalPreferences && typeof config.globalPreferences === 'object' ? config.globalPreferences : {},
+      { preserveNull: true }
+    );
+    const globalPreferences = { ...baseGlobal, ...incomingGlobal };
+
+    const rawToken = typeof config.setup_token === 'string' ? config.setup_token.trim() : '';
+    const setupToken = rawToken.length > 0 ? rawToken : generateSetupToken();
+
+    const networkShares = Array.isArray(config.networkShares)
+      ? config.networkShares
+          .filter((sh) => sh && typeof sh === 'object' && !Array.isArray(sh))
+          .map((sh) => normalizeNetworkShare(sh))
+      : [];
+
     return {
       version: Number(config.version) || 1,
-      globalPreferences: {
-        ...defaultPreferences,
-        ...(config.globalPreferences && typeof config.globalPreferences === 'object' ? config.globalPreferences : {})
-      },
+      globalPreferences,
       devicePreferences,
       servers: normalizeServers(config.servers),
-      networkShares: Array.isArray(config.networkShares) ? config.networkShares : [],
-      setup_token: typeof config.setup_token === 'string' && config.setup_token
-        ? config.setup_token
-        : ('sf-setup-' + Math.random().toString(36).substr(2, 9))
+      networkShares,
+      setup_token: setupToken
     };
   }
 
@@ -843,47 +1077,274 @@ function createStorage(options) {
     const normalized = normalizeConfig(config);
     const now = isoNow();
     const nextJson = JSON.stringify(normalized);
-    const current = statements.getState.get('config');
-    const currentJson = current ? current.value : null;
 
-    statements.upsertState.run('config', nextJson, now);
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = statements.getState.get('config');
+      const currentJson = current ? current.value : null;
+      const currentVer = Math.max(1, Number(statements.getState.get('config_version')?.value) || cachedConfigVersion);
+      const nextVer = currentVer + 1;
 
-    if (currentJson !== nextJson) {
-      statements.insertSnapshot.run(now, options.reason || 'config-update', nextJson);
+      statements.upsertState.run('config', nextJson, now);
+      statements.upsertState.run('config_version', String(nextVer), now);
+
+      if (currentJson !== nextJson) {
+        statements.insertSnapshot.run(now, options.reason || 'config-update', nextJson);
+      }
+
+      if (options.eventType) {
+        recordEvent(options.eventType, options.req, options.details || {});
+      }
+
+      db.exec('COMMIT');
+      cachedConfigVersion = nextVer;
+      return normalized;
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch (_) {}
+      throw error;
+    }
+  }
+
+  function saveConfigAndMigrateServerIds(nextConfig, migrations = [], reason = null) {
+    const normalized = normalizeConfig(nextConfig);
+    const now = isoNow();
+    const nextJson = JSON.stringify(normalized);
+    const validMigrations = (Array.isArray(migrations) ? migrations : []).filter(
+      (m) => m && m.oldId && m.newId && m.oldId !== m.newId
+    );
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec('PRAGMA defer_foreign_keys = ON');
+      const updateSessionServerId = db.prepare('UPDATE playback_sessions SET server_id = ? WHERE server_id = ?');
+      const selectOpenSessions = db.prepare(
+        'SELECT playback_session_id AS playbackSessionId FROM playback_sessions WHERE server_id = ? AND ended_at IS NULL'
+      );
+      const checkSessionKeyExists = db.prepare(
+        'SELECT 1 FROM playback_sessions WHERE playback_session_id = ?'
+      );
+      const updateSessionKey = db.prepare(
+        'UPDATE playback_sessions SET playback_session_id = ? WHERE playback_session_id = ?'
+      );
+      const updateSessionEventsKey = db.prepare(
+        'UPDATE playback_session_events SET playback_session_id = ? WHERE playback_session_id = ?'
+      );
+      const upsertMigratedMetadata = db.prepare(`
+        INSERT INTO media_item_metadata (
+          server_id, item_id, item_name, item_type, series_name, season_name,
+          production_year, premiere_date, official_rating, community_rating,
+          runtime_ticks, primary_image_tag, backdrop_image_tag, overview,
+          genres_json, image_blur_hash, last_refreshed_at
+        )
+        SELECT
+          ?, item_id, item_name, item_type, series_name, season_name,
+          production_year, premiere_date, official_rating, community_rating,
+          runtime_ticks, primary_image_tag, backdrop_image_tag, overview,
+          genres_json, image_blur_hash, last_refreshed_at
+        FROM media_item_metadata
+        WHERE server_id = ?
+        ON CONFLICT(server_id, item_id) DO UPDATE SET
+          item_name = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.item_name ELSE media_item_metadata.item_name END,
+          item_type = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.item_type ELSE media_item_metadata.item_type END,
+          series_name = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.series_name ELSE media_item_metadata.series_name END,
+          season_name = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.season_name ELSE media_item_metadata.season_name END,
+          production_year = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.production_year ELSE media_item_metadata.production_year END,
+          premiere_date = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.premiere_date ELSE media_item_metadata.premiere_date END,
+          official_rating = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.official_rating ELSE media_item_metadata.official_rating END,
+          community_rating = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.community_rating ELSE media_item_metadata.community_rating END,
+          runtime_ticks = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.runtime_ticks ELSE media_item_metadata.runtime_ticks END,
+          primary_image_tag = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.primary_image_tag ELSE media_item_metadata.primary_image_tag END,
+          backdrop_image_tag = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.backdrop_image_tag ELSE media_item_metadata.backdrop_image_tag END,
+          overview = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.overview ELSE media_item_metadata.overview END,
+          genres_json = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.genres_json ELSE media_item_metadata.genres_json END,
+          image_blur_hash = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.image_blur_hash ELSE media_item_metadata.image_blur_hash END,
+          last_refreshed_at = CASE WHEN excluded.last_refreshed_at >= media_item_metadata.last_refreshed_at THEN excluded.last_refreshed_at ELSE media_item_metadata.last_refreshed_at END
+      `);
+      const deleteOldMetadata = db.prepare('DELETE FROM media_item_metadata WHERE server_id = ?');
+
+      for (const { oldId, newId } of validMigrations) {
+        const openRows = selectOpenSessions.all(oldId);
+        updateSessionServerId.run(newId, oldId);
+
+        const prefix = `${oldId}:`;
+        for (const row of openRows) {
+          if (!row.playbackSessionId || !row.playbackSessionId.startsWith(prefix)) continue;
+          const newKey = sanitizeText(newId + row.playbackSessionId.slice(oldId.length), 160);
+          if (!newKey || newKey === row.playbackSessionId) continue;
+          if (!checkSessionKeyExists.get(newKey)) {
+            updateSessionKey.run(newKey, row.playbackSessionId);
+            updateSessionEventsKey.run(newKey, row.playbackSessionId);
+          }
+        }
+
+        upsertMigratedMetadata.run(newId, oldId);
+        deleteOldMetadata.run(oldId);
+      }
+
+      const currentVer = Math.max(1, Number(statements.getState.get('config_version')?.value) || cachedConfigVersion);
+      const nextVer = currentVer + 1;
+      statements.upsertState.run('config', nextJson, now);
+      statements.upsertState.run('config_version', String(nextVer), now);
+      statements.insertSnapshot.run(now, reason || 'server-id-migration', nextJson);
+      if (reason) {
+        statements.insertEvent.run(reason, now, null, null, JSON.stringify({ migratedServers: validMigrations.length }));
+      }
+
+      db.exec('COMMIT');
+      cachedConfigVersion = nextVer;
+      return normalized;
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch (_) {}
+      throw error;
+    }
+  }
+
+  function getConfigVersion() {
+    return cachedConfigVersion;
+  }
+
+  function getInstanceId() {
+    return cachedInstanceId;
+  }
+
+  function getAdminPasswordHash() {
+    return cachedAdminPasswordHash;
+  }
+
+  function setAdminPasswordHashIfUnset(hash) {
+    const now = isoNow();
+    const res = statements.setStateIfUnset.run('admin_password_hash', String(hash), now);
+    if (res.changes > 0) {
+      cachedAdminPasswordHash = String(hash);
+      return { changed: true, changes: res.changes };
+    }
+    return { changed: false, changes: 0 };
+  }
+
+  function isSetupTokenWeak(token) {
+    if (token !== undefined) return isSetupTokenWeakValue(token);
+    const cfg = getConfig();
+    return isSetupTokenWeakValue(cfg.setup_token);
+  }
+
+  function getStateValue(key) {
+    const row = statements.getState.get(key);
+    return row ? row.value : null;
+  }
+
+  function setStateValue(key, value) {
+    statements.upsertState.run(key, String(value), isoNow());
+  }
+
+  function deleteStateValue(key) {
+    statements.deleteState.run(key);
+  }
+
+  function getConfigPullStats() {
+    const rows = statements.syncEventsSince.all(cachedTelemetryStartedAt);
+    const nowMs = Date.now();
+    const sixtyDaysAgoIso = new Date(nowMs - 60 * 86_400_000).toISOString();
+    let total = 0;
+    let qcBroker = 0;
+    let legacy = 0;
+    let last60DaysLegacy = 0;
+    let lastLegacyPullAt = null;
+
+    for (const row of rows) {
+      total += 1;
+      const details = safeParseJson(row.details_json) || {};
+      if (details.qcBroker === true) {
+        qcBroker += 1;
+      } else {
+        legacy += 1;
+        if (row.created_at >= sixtyDaysAgoIso) {
+          last60DaysLegacy += 1;
+        }
+        if (!lastLegacyPullAt || row.created_at > lastLegacyPullAt) {
+          lastLegacyPullAt = row.created_at;
+        }
+      }
     }
 
-    if (options.eventType) {
-      recordEvent(options.eventType, options.req, options.details || {});
-    }
+    const startedMs = Date.parse(cachedTelemetryStartedAt);
+    const telemetryAgeDays = Number.isFinite(startedMs) ? (nowMs - startedMs) / 86_400_000 : 0;
+    const legacySunsetReady = last60DaysLegacy === 0 && qcBroker > 0 && telemetryAgeDays >= 60;
 
-    return normalized;
+    return {
+      configPulls: {
+        total,
+        qcBroker,
+        legacy,
+        last60DaysLegacy,
+        lastLegacyPullAt,
+      },
+      legacySunsetReady,
+    };
   }
 
   function recordEvent(type, req, details = {}) {
+    if (vacuumInFlight) return;
     statements.insertEvent.run(
       type,
       isoNow(),
       req ? (req.ip || req.socket?.remoteAddress || null) : null,
-      req ? (req.headers['user-agent'] || null) : null,
+      req ? (req.headers?.['user-agent'] || null) : null,
       JSON.stringify(details)
     );
   }
 
-  
+  function upsertDevice({ deviceId, deviceName, appVersion, lastIp } = {}) {
+    if (vacuumInFlight) return;
+    const cleanId = sanitizeText(deviceId, 128).trim();
+    if (!cleanId) return;
+    const cleanName = sanitizeText(deviceName || '', 160).trim() || cleanId;
+    const cleanAppVersion = sanitizeText(appVersion || '', 80).trim() || null;
+    const cleanIp = sanitizeText(lastIp || '', 120).trim() || null;
+    const now = isoNow();
+    statements.upsertDeviceMeta.run(cleanId, cleanName, cleanAppVersion, now, now, cleanIp);
+  }
+
   function createAdminSession(token, ttlMs) {
     const now = isoNow();
     const ttl = Number(ttlMs);
-    // ttlMs === undefined -> no expiry (legacy callers). Any finite number
-    // (including 0/negative) applies an absolute expires_at so tests can
-    // construct already-expired sessions deterministically.
     const expiresAt = Number.isFinite(ttl)
       ? new Date(Date.now() + ttl).toISOString()
       : null;
     statements.createSession.run(token, now, expiresAt, now);
+    if (vacuumInFlight) {
+      adminSessionSnapshot.set(sha256Hex(token), expiresAt);
+    }
+  }
+
+  function checkSnapshotAdminSession(token) {
+    const digest = sha256Hex(token);
+    if (!adminSessionSnapshot.has(digest)) return false;
+    const expiresAt = adminSessionSnapshot.get(digest);
+    if (expiresAt && expiresAt <= isoNow()) {
+      adminSessionSnapshot.delete(digest);
+      return false;
+    }
+    return true;
+  }
+
+  function isAdminSessionValid(token) {
+    if (!token || typeof token !== 'string') return false;
+    if (vacuumInFlight) {
+      return checkSnapshotAdminSession(token);
+    }
+    const row = statements.getSession.get(token);
+    if (!row) return false;
+    if (row.expiresAt && row.expiresAt <= isoNow()) {
+      return false;
+    }
+    return true;
   }
 
   function validateAdminSession(token) {
     if (!token || typeof token !== 'string') return false;
+    if (vacuumInFlight) {
+      return checkSnapshotAdminSession(token);
+    }
     const row = statements.getSession.get(token);
     if (!row) return false;
     if (row.expiresAt && row.expiresAt <= isoNow()) {
@@ -896,10 +1357,14 @@ function createStorage(options) {
 
   function deleteAdminSession(token) {
     if (!token) return;
-    statements.deleteSession.run(token);
+    adminSessionSnapshot.delete(sha256Hex(token));
+    if (!vacuumInFlight) {
+      statements.deleteSession.run(token);
+    }
   }
 
   function pruneExpiredAdminSessions() {
+    if (vacuumInFlight) return;
     statements.pruneExpiredSessions.run(isoNow());
   }
 
@@ -907,19 +1372,160 @@ function createStorage(options) {
     return statements.getSnapshots.all();
   }
 
-  function restoreConfigSnapshot(id) {
+  function getConfigSnapshot(id) {
     const row = statements.getSnapshotById.get(id);
-    if (!row) return false;
-    db.exec('BEGIN');
+    if (!row || !row.config_json) return null;
+    return safeParseJson(row.config_json);
+  }
+
+  function isVacuumInFlight() {
+    return vacuumInFlight;
+  }
+
+  function enterVacuumInFlight() {
+    adminSessionSnapshot.clear();
+    const rows = statements.getAllActiveSessions.all(isoNow());
+    for (const row of rows) {
+      if (row && row.token) {
+        adminSessionSnapshot.set(sha256Hex(row.token), row.expiresAt || null);
+      }
+    }
+    vacuumInFlight = true;
+  }
+
+  function exitVacuumInFlight() {
+    vacuumInFlight = false;
+    adminSessionSnapshot.clear();
+  }
+
+  function runWorkerTask(task) {
+    const job = () =>
+      new Promise((resolve, reject) => {
+        if (closed) {
+          reject(new Error('Storage is closed'));
+          return;
+        }
+        const workerPath = path.join(__dirname, 'storage-vacuum-worker.js');
+        const worker = new Worker(workerPath, {
+          workerData: { ...task, dbFile },
+        });
+        activeWorker = worker;
+        let settled = false;
+
+        const finish = (err, res) => {
+          if (settled) return;
+          settled = true;
+          if (activeWorker === worker) activeWorker = null;
+          if (err) reject(err);
+          else resolve(res);
+        };
+
+        worker.once('message', (msg) => {
+          if (msg && msg.ok) {
+            finish(null, msg.result);
+          } else {
+            const e = new Error(msg?.error?.message || 'Storage worker failed');
+            if (msg?.error?.code) e.code = msg.error.code;
+            if (msg?.error?.errcode) e.errcode = msg.error.errcode;
+            finish(e);
+          }
+        });
+        worker.once('error', (err) => finish(err));
+        worker.once('exit', (code) => {
+          if (!settled) {
+            finish(new Error(`Storage worker exited unexpectedly with code ${code}`));
+          }
+        });
+      });
+
+    const next = workerQueue.then(job, job);
+    workerQueue = next.catch(() => {});
+    return next;
+  }
+
+  function runStage1UpgradeInWorker(normalizedConfigJson) {
+    return runWorkerTask({
+      op: 'stage1-upgrade',
+      preBackupPath: preStage1BackupPath,
+      normalizedConfigJson,
+    });
+  }
+
+  function runVacuumInWorker() {
+    return runWorkerTask({ op: 'vacuum' });
+  }
+
+  function runBackupInWorker(destPath) {
+    return runWorkerTask({ op: 'vacuum-into', destPath });
+  }
+
+  function runScrubHistoricalBackupsInWorker() {
+    return runWorkerTask({
+      op: 'scrub-historical-backups',
+      backupsDir,
+    });
+  }
+
+  function hasPreStage1Backup() {
     try {
-      statements.upsertState.run('config', row.config_json, isoNow());
-      statements.insertSnapshot.run(isoNow(), 'restored-snapshot-' + id, row.config_json);
-      db.exec('COMMIT');
-      return true;
+      return fs.existsSync(preStage1BackupPath);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function prunePreStage1Backup(maxAgeDays = 14) {
+    try {
+      if (!fs.existsSync(preStage1BackupPath)) return { deleted: false };
+      const stat = fs.lstatSync(preStage1BackupPath);
+      if (!stat.isFile() || stat.isSymbolicLink()) return { deleted: false };
+      const ageMs = Date.now() - stat.mtimeMs;
+      if (ageMs >= maxAgeDays * 86_400_000) {
+        fs.unlinkSync(preStage1BackupPath);
+        return { deleted: true };
+      }
+      return { deleted: false, ageDays: ageMs / 86_400_000 };
+    } catch (_) {
+      return { deleted: false };
+    }
+  }
+
+  function vacuumInto(destPath) {
+    assertNotSymlink(destPath);
+    const dir = path.dirname(destPath);
+    ensureDir(dir, 0o700);
+    const tempPath = path.join(
+      dir,
+      `.${path.basename(destPath)}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`
+    );
+    try {
+      db.prepare('VACUUM INTO ?').run(tempPath);
+      guardedChmod(tempPath, 0o600);
+      fs.renameSync(tempPath, destPath);
+      guardedChmod(destPath, 0o600);
     } catch (err) {
-      db.exec('ROLLBACK');
+      try {
+        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      } catch (_) {}
       throw err;
     }
+  }
+
+  async function close() {
+    if (closed) return;
+    closed = true;
+    const workerToStop = activeWorker;
+    if (workerToStop) {
+      try {
+        await workerToStop.terminate();
+      } catch (_) {}
+    }
+    try {
+      await workerQueue;
+    } catch (_) {}
+    try {
+      db.close();
+    } catch (_) {}
   }
 
   function getSyncLog(limit = 100) {
@@ -944,7 +1550,7 @@ function createStorage(options) {
 
   
   function clearDeviceLogs(deviceId) {
-    db.exec('BEGIN');
+    db.exec('BEGIN IMMEDIATE');
     try {
       statements.clearDeviceLogs.run(deviceId);
       statements.resetDeviceLogCount.run(deviceId);
@@ -963,7 +1569,7 @@ function createStorage(options) {
   }
 
   function deleteDevice(deviceId) {
-    db.exec('BEGIN');
+    db.exec('BEGIN IMMEDIATE');
     try {
       statements.clearDeviceLogs.run(deviceId);
       const result = statements.deleteDevice.run(deviceId);
@@ -981,7 +1587,7 @@ function createStorage(options) {
   }
 
   function clearAllPlaybackSessions() {
-    db.exec('BEGIN');
+    db.exec('BEGIN IMMEDIATE');
     try {
       statements.deleteAllPlaybackSessionEvents.run();
       const result = statements.deleteAllPlaybackSessions.run();
@@ -998,11 +1604,14 @@ function createStorage(options) {
     if (!Number.isFinite(parsed) || parsed <= 0) {
       throw new Error('days must be a positive number');
     }
-    const cutoff = new Date(Date.now() - parsed * 86400 * 1000).toISOString();
-    db.exec('BEGIN');
+    const now = Date.now();
+    const cutoffMs = now - parsed * 86_400_000;
+    const cutoff = new Date(cutoffMs).toISOString();
+    const syncPullCutoff = new Date(Math.min(cutoffMs, now - 65 * 86_400_000)).toISOString();
+    db.exec('BEGIN IMMEDIATE');
     try {
       const sessions = statements.deletePlaybackSessionsOlderThan.run(cutoff);
-      const events = statements.deleteEventsOlderThan.run(cutoff);
+      const events = statements.deleteEventsOlderThan.run(cutoff, syncPullCutoff);
       db.exec('COMMIT');
       return { deleted: sessions.changes, eventsDeleted: events.changes, cutoff };
     } catch (error) {
@@ -1017,7 +1626,7 @@ function createStorage(options) {
       throw new Error('days must be a positive number');
     }
     const cutoff = new Date(Date.now() - parsed * 86400 * 1000).toISOString();
-    db.exec('BEGIN');
+    db.exec('BEGIN IMMEDIATE');
     try {
       const result = statements.deleteDeviceLogsOlderThan.run(cutoff);
       statements.refreshDeviceEntryCounts.run();
@@ -1064,7 +1673,7 @@ function createStorage(options) {
     const entries = Array.isArray(payload.logs) ? payload.logs : [];
     let latestEntryAt = existing ? existing.latestEntryAt : null;
 
-    db.exec('BEGIN');
+    db.exec('BEGIN IMMEDIATE');
     try {
       statements.upsertDevice.run(
         deviceId,
@@ -1154,7 +1763,7 @@ function createStorage(options) {
     const sessions = normalizePlaybackSessionsPayload(payload, now);
     let accepted = 0;
 
-    db.exec('BEGIN');
+    db.exec('BEGIN IMMEDIATE');
     try {
       sessions.forEach((session) => {
         statements.upsertPlaybackSession.run(
@@ -1213,7 +1822,7 @@ function createStorage(options) {
   function upsertMediaItemMetadata(entries) {
     const items = Array.isArray(entries) ? entries : [];
     let accepted = 0;
-    db.exec('BEGIN');
+    db.exec('BEGIN IMMEDIATE');
     try {
       items.forEach((entry) => {
         if (!entry || !entry.serverId || !entry.itemId) return;
@@ -1527,7 +2136,7 @@ function createStorage(options) {
     );
 
     let closed = 0;
-    db.exec('BEGIN');
+    db.exec('BEGIN IMMEDIATE');
     try {
       openSessions.forEach((session) => {
         if (activePlaybackSessionIds.has(session.playbackSessionId)) return;
@@ -1648,10 +2257,11 @@ function createStorage(options) {
   }
 }
 
-function ensureDir(dir) {
+function ensureDir(dir, mode = 0o700) {
   if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true, mode });
   }
+  guardedChmod(dir, mode);
 }
 
 function isoNow() {
@@ -1909,6 +2519,9 @@ function buildAnalyticsRangeWhereClause(options = {}, baseWhere) {
 
 module.exports = {
   createStorage,
+  generateSetupToken,
+  isSetupTokenWeakValue,
+  STRONG_SETUP_TOKEN_REGEX,
   DEFAULT_MAX_LOG_ENTRIES_PER_DEVICE,
   DEFAULT_MAX_LOG_MESSAGE_LENGTH
 };

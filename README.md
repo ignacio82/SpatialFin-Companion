@@ -4,7 +4,8 @@ SpatialFin Companion is the local management and analytics hub for the **Spatial
 
 ## Features
 
-- QR-based headset onboarding with a per-instance setup token.
+- QR-based headset and TV onboarding with a per-instance setup token ("Set up a device" modal supporting mDNS discovery, receiver v1 JSON QR, `/setup#t=<pairing_token>` QR, and synchronous v2 handoff).
+- Passwordless Quick Connect user linking (`POST /api/admin/quick-connect/{initiate,poll,cancel}`), per-device Quick Connect broker approval (`POST /api/v1/auth/authorize-quick-connect`, `qc_broker_v1` / `webxr_client_v1` capability negotiation), and canonical Jellyfin `SystemInfo.Id` server migration (`srv-*` canonicalization with `legacy_ids[0]` compatibility).
 - Centralized Jellyfin server and user management.
 - User verification that stores Jellyfin access tokens for sync and realtime analytics.
 - Global preference sync for playback, language, voice assistant, diagnostics, and service integrations.
@@ -77,9 +78,19 @@ To pin to the image you built and skip auto-updates, set
 > compose up -d --build` once to install the auto-updater. Every release after
 > that will roll out automatically.
 
-### Optional admin password
+### Health checks & container image updates
 
-Set `COMPANION_ADMIN_PASSWORD` before starting the container if you want the dashboard locked behind a login screen.
+The server exposes `GET /healthz` (`200 {"ok":true}`), wired to a Docker `HEALTHCHECK` in the `Dockerfile`. If you run an existing container with `COMPANION_AUTO_UPDATE=true`, run `git pull && docker compose up -d --build` once after upgrading to Stage 1 so Docker picks up the updated `Dockerfile` `HEALTHCHECK` and image layers.
+
+### Rollout ordering & rollback
+
+- **Android-first rollout:** Update SpatialFin Android clients to Stage 1 **before** upgrading SpatialFin Companion so headsets already send the hardened auth/sync headers and token-scoped requests.
+- **SQLite backups & `pre-stage1.bak`:** Rolling backups use `storage.vacuumInto` (hot consistent SQLite snapshots). On Stage 1 migration, a `pre-stage1.bak` snapshot is created under `./data/backups/` and retained for up to 14 days for rollback — you may delete `pre-stage1.bak` immediately once you have verified the upgrade.
+- **Rolling back an auto-updating container:** Set `COMPANION_AUTO_UPDATE=false` before checking out or pinning an older tag (otherwise `entrypoint.sh` / `updater.js` will immediately jump forward to the latest release). If publishing a rollback release tag for auto-updating fleets, bump `"version"` in both `package.json` and `package-lock.json` above the broken tag so `updater.js` detects it as newer.
+
+### Optional admin password & bootstrap PIN
+
+Set `COMPANION_ADMIN_PASSWORD` before starting the container to lock the dashboard behind an authenticated session. When `COMPANION_ADMIN_PASSWORD` is unset, first-time / remote-LAN admin sessions are gated by a one-time `bootstrapPin` logged on startup (and CSRF-protected via `X-CSRF-Token` + `Origin`/`Referer` checks).
 
 Example:
 
@@ -204,8 +215,12 @@ Notes:
 ## Security Notes
 
 - The companion is intended to run on your local network.
-- Public headset sync endpoints require the current `setup_token`.
-- Admin routes can be protected with `COMPANION_ADMIN_PASSWORD`.
+- Outbound HTTP probes/proxies pass through `safe-fetch.js` (SSRF protection, DNS/IP filtering, redirect re-validation, and loopback allowlist migration for upgraded installs).
+- Admin routes use session auth (`COMPANION_ADMIN_PASSWORD` or startup `bootstrapPin`), CSRF protection, optimistic concurrency (`If-Match` / `configVersion`), and per-client rate limiting (IPv4 `/32` and IPv6 `/64` bucketing).
+- Config responses redact stored secrets via `config-redaction.js` so dashboard payloads never leak raw Jellyfin/AI/Seerr/TMDB/share tokens back to the browser.
+- Public headset sync endpoints require the current `setup_token`. If an older install still has a weak legacy `setup_token`, the dashboard surfaces a weak-token warning banner prompting manual rotation (Companion never auto-rotates `setup_token` behind your back).
+- WebSocket channels are isolated: `adminSyncWss` requires an authenticated admin session, while `fcastWss` requires a valid setup token / receiver registration.
+- **HTTPS-hosted WebXR (`https://...`) → Companion FCast:** Browsers block mixed-content `ws://` connections from HTTPS pages. Terminate TLS in front of Companion (reverse proxy) and configure a `wss://` endpoint when casting from HTTPS-hosted SpatialFin WebXR.
 - Rotating the setup token invalidates existing headset sync tokens until the headset is re-paired or updated with the new token.
 
 ## Development

@@ -21,11 +21,14 @@ release reaches users within ~24 hours.** Treat releases as production.
 
 | File | Purpose |
 | --- | --- |
-| `index.js` | HTTP + WebSocket server, admin/headset APIs, analytics pipeline |
-| `storage.js` | SQLite layer (config, devices, events, sessions, logs, backups) |
-| `default-preferences.js` | Default headset preferences synced to clients |
-| `network-shares.js`, `nfs-rpc.js`, `smb-probe.js`, `share-discovery.js`, `share-test-utils.js` | SMB / NFS discovery + validation |
-| `tv-pairing.js` | TV receiver pairing helpers |
+| `index.js` | Exports `createCompanionApp` + starts HTTP/WebSocket server (`adminSyncWss`, `fcastWss`), `/healthz`, admin/headset APIs, analytics pipeline |
+| `safe-fetch.js` | Outbound SSRF guard (DNS/IP validation, redirect re-validation, loopback allowlist migration) |
+| `config-redaction.js` | Secret redaction + placeholder preservation for admin config GET/PUT payloads |
+| `storage.js` | SQLite layer (config + `configVersion`, devices, events, sessions, logs, `vacuumInto` backups, `pre-stage1.bak` retention) |
+| `default-preferences.js` | Default headset preferences synced to clients (App Lock & download encryption remain local-enrollment-only on Android) |
+| `network-shares.js`, `nfs-rpc.js`, `smb-probe.js`, `share-discovery.js`, `share-test-utils.js` | SMB / NFS discovery + validation (`share-discovery.js` isolates LAN share probing) |
+| `tv-pairing.js` | Device setup / TV pairing helpers (v1 envelope, v2 `companion-handoff` payload, `/setup#t=` QR parsing) |
+| `quick-connect.js` | Stage 2 Quick Connect admin linking, broker authorization, Predicate 1 impact evaluation, and `srv-*` canonical merge helpers |
 | `updater.js` | Daily GitHub release check; exits the process when a newer tag is found |
 | `entrypoint.sh` | Pulls the newest release tag on boot, runs `npm ci` when `package-lock.json` changes, then execs node |
 | `Dockerfile` | Clones the repo + checks out latest release tag at build time |
@@ -145,8 +148,15 @@ lives in `public/` and is committed to git.
 - **Never break `entrypoint.sh`.** If it crashes, every container enters a
   restart loop and self-healing stops.
 - **Keep `/app/.git` valid at runtime.** The boot-time pull depends on it.
+- **Stage 1 security & rollout guardrails:**
+  - Admin endpoints require session auth (`COMPANION_ADMIN_PASSWORD` or startup `bootstrapPin`), CSRF verification, `If-Match` / `configVersion` concurrency checks on config writes, and rate-limit bucketing by IPv4 `/32` / IPv6 `/64`.
+  - Upgraded configs migrate loopback URLs through the loopback allowlist rather than opening unrestricted loopback SSRF; weak legacy `setup_token` values trigger an admin UI banner only (never auto-rotate silently).
+  - Keep `adminSyncWss` and `fcastWss` strictly isolated on separate auth paths. HTTPS-hosted SpatialFin WebXR requires a `wss://` proxy endpoint for FCast.
+  - Maintain `GET /healthz` and the `Dockerfile` `HEALTHCHECK` (operators on `COMPANION_AUTO_UPDATE=true` must pull/rebuild the image once to pick up `Dockerfile` changes).
+  - Use `storage.vacuumInto` for hot SQLite backups; `pre-stage1.bak` has a 14-day retention window and can be removed immediately after verifying upgrade health.
+  - **Release ordering & rollback:** Ship Stage 1 Android clients **before** releasing Stage 1 Companion, and Stage 2 Android clients before Stage 2 Companion. Stage 2 adds Quick Connect linking (`/api/admin/quick-connect/*`), per-device broker approval (`POST /api/v1/auth/authorize-quick-connect` behind `requireSetupTokenOnly`), `srv-*` canonicalization (`saveConfigAndMigrateServerIds`), synchronous `POST /api/admin/device-setup/handoff` (`v2` / `v1`), `qc_broker_v1` / `webxr_client_v1` token omission, `legacy_ids[0]` projection for legacy clients, and `legacySunsetReady` diagnostics (60-day sunset gate before retiring legacy `/api/v1/config` token delivery and v1 `/api/v1/tv-pairing/config`). For local rollbacks, set `COMPANION_AUTO_UPDATE=false`; for fleet rollback tags, bump `"version"` in both `package.json` and `package-lock.json` above the broken tag so `updater.js` upgrades onto the rollback tag.
 - **LAN threat model.** The service assumes a trusted LAN. Headset auth is the
-  setup token; admin auth is optional password + session. Don't widen trust
+  setup token; admin auth is `COMPANION_ADMIN_PASSWORD` / `bootstrapPin` + CSRF-protected session. Don't widen trust
   without discussion.
 - **No backwards-compat cruft for your own recent changes.** Rename freely;
   don't leave `_deprecated` shims behind.
