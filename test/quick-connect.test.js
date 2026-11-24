@@ -414,3 +414,100 @@ test('Legacy non-srv server IDs canonicalize on startup and needs_relink omits d
     await jf.close();
   }
 });
+
+test('runAnalyticsSync skips needs_relink users and quick-connect-status reports enabled/disabled/unreachable', async () => {
+  const { checkQuickConnectEnabled } = require('../quick-connect');
+  let sessionPolls = 0;
+  let qcEnabledMode = 'true';
+  const jf = await startMockJellyfin((req, res) => {
+    if (req.url.startsWith('/Sessions')) {
+      sessionPolls += 1;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('[]');
+      return;
+    }
+    if (req.url === '/QuickConnect/Enabled') {
+      if (qcEnabledMode === 'true') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('true');
+      } else if (qcEnabledMode === 'false') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('false');
+      } else {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Disabled' }));
+      }
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  const app = await startTestApp({
+    servers: [
+      {
+        id: '11111111222233334444555566667777',
+        name: 'JF',
+        addresses: [jf.url],
+        users: [
+          { id: 'u-expired', username: 'Expired', access_token: 'dead-token', needs_relink: true },
+        ],
+      },
+      {
+        id: '99999999888877776666555544443333',
+        name: 'UnreachableJF',
+        addresses: ['http://127.0.0.1:1'],
+        users: [],
+      },
+    ],
+  });
+
+  try {
+    const syncRes = await adminReq(app.baseUrl, 'POST', '/api/admin/analytics/sync-now', {});
+    assert.equal(syncRes.status, 200);
+    assert.equal(sessionPolls, 0, 'needs_relink users must be skipped during analytics sync');
+
+    // Enabled -> { enabled: true, reachable: true }
+    qcEnabledMode = 'true';
+    const rEnabled = await adminReq(app.baseUrl, 'GET', '/api/admin/servers/11111111222233334444555566667777/quick-connect-status');
+    assert.equal(rEnabled.status, 200);
+    assert.equal(rEnabled.data.enabled, true);
+    assert.equal(rEnabled.data.reachable, true);
+
+    // 200 false -> { enabled: false, reachable: true }
+    qcEnabledMode = 'false';
+    const rFalse = await adminReq(app.baseUrl, 'GET', '/api/admin/servers/11111111222233334444555566667777/quick-connect-status');
+    assert.equal(rFalse.status, 200);
+    assert.equal(rFalse.data.enabled, false);
+    assert.equal(rFalse.data.reachable, true);
+
+    // 401 -> { enabled: false, reachable: true }
+    qcEnabledMode = '401';
+    const r401 = await adminReq(app.baseUrl, 'GET', '/api/admin/servers/11111111222233334444555566667777/quick-connect-status');
+    assert.equal(r401.status, 200);
+    assert.equal(r401.data.enabled, false);
+    assert.equal(r401.data.reachable, true);
+
+    // Unreachable -> { enabled: null, reachable: false }
+    const rUnreach = await adminReq(app.baseUrl, 'GET', '/api/admin/servers/99999999888877776666555544443333/quick-connect-status');
+    assert.equal(rUnreach.status, 200);
+    assert.equal(rUnreach.data.enabled, null);
+    assert.equal(rUnreach.data.reachable, false);
+
+    // Unknown server -> 404
+    const rMissing = await adminReq(app.baseUrl, 'GET', '/api/admin/servers/nonexistent/quick-connect-status');
+    assert.equal(rMissing.status, 404);
+
+    // Direct helper check with empty addresses
+    const emptyRes = await checkQuickConnectEnabled({
+      serverConfig: { addresses: [] },
+      safeHttpJson: async () => ({ status: 200, data: true }),
+      buildJellyfinAuthHeaders: () => ({}),
+    });
+    assert.equal(emptyRes.enabled, null);
+    assert.equal(emptyRes.reachable, false);
+  } finally {
+    await app.close();
+    await jf.close();
+  }
+});

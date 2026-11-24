@@ -844,7 +844,12 @@ function ServerCard({
                             <span className="dot"/> Re-link via Quick Connect
                           </button>
                         ) : verified ? (
-                          <span className="chip ok"><span className="dot"/> Verified</span>
+                          <>
+                            <span className="chip ok"><span className="dot"/> Verified</span>
+                            {user.quick_connect_broker_enabled === false && (
+                              <span className="chip warn"><span className="dot"/> Manual login only</span>
+                            )}
+                          </>
                         ) : (
                           <span className="chip warn"><span className="dot"/> Pending</span>
                         )}
@@ -957,6 +962,19 @@ function UserOverrides({ user, configVersion, onChange, busy }) {
     >
       <div className="eyebrow" style={{ marginBottom: 8, color: 'var(--teal-bright)' }}>
         Per-user overrides
+      </div>
+      <div className="setting-row" style={{ padding: '6px 0' }}>
+        <div>
+          <div className="lbl">Allow Quick Connect auto-approval</div>
+          <div className="desc">When disabled, paired devices must sign in to this account manually instead of using Companion's setup token.</div>
+        </div>
+        <div className="ctl">
+          <Toggle
+            on={user.quick_connect_broker_enabled !== false}
+            onChange={(v) => onChange({ quick_connect_broker_enabled: v }, draftBaseVersion)}
+            disabled={busy}
+          />
+        </div>
       </div>
       <div className="setting-row" style={{ padding: '6px 0' }}>
         <div>

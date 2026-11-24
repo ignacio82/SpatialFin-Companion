@@ -80,6 +80,7 @@ const {
   pollQuickConnect,
   exchangeQuickConnect,
   authorizeQuickConnect,
+  checkQuickConnectEnabled,
   evaluateServerAddressBindingImpact,
   mergeCanonicalServerInDraft,
   generatePendingId,
@@ -1096,6 +1097,7 @@ function createCompanionApp(options = {}) {
           details: { serverId: srv.id, userId: user.id || user.username },
         });
         broadcastConfigChanged();
+        reconcileJellyfinRealtimeSockets();
       }).catch((err) => {
         console.warn('[relink] Failed to mark user needs_relink:', err?.message || err);
       });
@@ -1787,7 +1789,7 @@ function createCompanionApp(options = {}) {
       const desiredKeys = new Set();
       const servers = Array.isArray(appConfig.servers) ? appConfig.servers : [];
       servers.forEach((server) => {
-        const users = Array.isArray(server.users) ? server.users.filter((user) => user && user.access_token) : [];
+        const users = Array.isArray(server.users) ? server.users.filter((user) => user && user.access_token && !user.needs_relink) : [];
         users.forEach((user) => {
           const key = buildJellyfinSocketKey(server, user);
           desiredKeys.add(key);
@@ -1834,7 +1836,7 @@ function createCompanionApp(options = {}) {
     try {
       const snapshotServers = Array.isArray(appConfig.servers) ? structuredClone(appConfig.servers) : [];
       for (const server of snapshotServers) {
-        const users = Array.isArray(server.users) ? server.users.filter((user) => user && user.access_token) : [];
+        const users = Array.isArray(server.users) ? server.users.filter((user) => user && user.access_token && !user.needs_relink) : [];
         if (!users.length) continue;
         polledServers += 1;
         for (const user of users) {
@@ -5203,6 +5205,25 @@ function createCompanionApp(options = {}) {
     }
   });
 
+  adminRouter.get('/servers/:serverId/quick-connect-status', async (req, res) => {
+    const serverId = String(req.params.serverId || '').trim();
+    const server = findConfigServerByIdInConfig(appConfig, serverId);
+    if (!server) {
+      return res.status(404).json({ error: 'Server not found', error_code: 'server_not_found' });
+    }
+    const status = await checkQuickConnectEnabled({
+      serverConfig: server,
+      safeHttpJson,
+      buildJellyfinAuthHeaders,
+    });
+    return res.json({
+      serverId: server.id,
+      enabled: status.enabled,
+      reachable: status.reachable,
+      errorCode: status.errorCode || null,
+    });
+  });
+
   // Probe & discovery admin routes
   adminRouter.post('/test-jellyfin', async (req, res) => {
     const rawUrl = String((req.body && req.body.url) || '').trim();
@@ -5753,6 +5774,7 @@ function createCompanionApp(options = {}) {
               const hasToken = typeof u.access_token === 'string' && u.access_token.trim().length > 0;
               const tokenUsable = hasToken && u.needs_relink !== true;
               u.has_verified_token = tokenUsable;
+              u.quick_connect_broker_enabled = u.quick_connect_broker_enabled !== false;
               if (isQcBroker || u.needs_relink === true) {
                 delete u.access_token;
               }
@@ -5808,8 +5830,11 @@ function createCompanionApp(options = {}) {
       if (!user) {
         return res.status(404).json({ error: 'User not found on server', error_code: 'user_not_found' });
       }
-      if (!user.access_token || !String(user.access_token).trim()) {
+      if (!user.access_token || !String(user.access_token).trim() || user.needs_relink === true) {
         return res.status(409).json({ error: 'User does not have a verified token', error_code: 'no_verified_user' });
+      }
+      if (user.quick_connect_broker_enabled === false) {
+        return res.status(403).json({ error: 'Quick Connect auto-approval is disabled for this user.', error_code: 'qc_broker_rejected' });
       }
 
       if (!checkAndRecordAuthorizePerUserLimit(server.id, user.id)) {

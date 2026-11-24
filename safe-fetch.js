@@ -334,6 +334,18 @@ function getOwnLocalIps() {
       if (unwrapped) ips.add(unwrapped.toLowerCase());
     }
   }
+  const extraRaw = [process.env.COMPANION_HOST_IP, process.env.COMPANION_SELF_IPS]
+    .filter((v) => typeof v === 'string' && v.trim())
+    .join(',');
+  if (extraRaw) {
+    for (const token of extraRaw.split(/[\s,]+/)) {
+      const clean = stripBrackets(String(token || '').trim().split('%')[0]);
+      if (!clean || !net.isIP(clean)) continue;
+      ips.add(clean.toLowerCase());
+      const unwrapped = unwrapIpv4InIpv6(clean);
+      if (unwrapped) ips.add(unwrapped.toLowerCase());
+    }
+  }
   return ips;
 }
 

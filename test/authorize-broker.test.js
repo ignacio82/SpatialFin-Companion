@@ -57,6 +57,7 @@ async function startTestApp(seedConfig) {
 
 test('POST /api/v1/auth/authorize-quick-connect enforces requireSetupTokenOnly, openCors, exact UUID match, and error precedence', async () => {
   let authorizeMode = 'ok';
+  let authorizeCallCount = 0;
   const jf = await startMockJellyfin((req, res) => {
     if (req.url === '/System/Info/Public') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -69,6 +70,7 @@ test('POST /api/v1/auth/authorize-quick-connect enforces requireSetupTokenOnly, 
       return;
     }
     if (req.url.startsWith('/QuickConnect/Authorize')) {
+      authorizeCallCount += 1;
       if (authorizeMode === 'ok') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end('true');
@@ -99,6 +101,18 @@ test('POST /api/v1/auth/authorize-quick-connect enforces requireSetupTokenOnly, 
         users: [
           { id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', username: 'Alice', access_token: 'tok-alice' },
           { id: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff', username: 'Bob', access_token: '' },
+          {
+            id: 'cccccccc-dddd-eeee-ffff-000000000000',
+            username: 'Carol',
+            access_token: 'tok-carol',
+            quick_connect_broker_enabled: false,
+          },
+          {
+            id: 'dddddddd-eeee-ffff-0000-111111111111',
+            username: 'Dave',
+            access_token: 'tok-dave-expired',
+            needs_relink: true,
+          },
         ],
       },
     ],
@@ -196,6 +210,28 @@ test('POST /api/v1/auth/authorize-quick-connect enforces requireSetupTokenOnly, 
     const legacyJson = await cfgLegacy.json();
     assert.equal(legacyJson.servers[0].id, 'srv-old-1');
     assert.equal(legacyJson.servers[0].users[0].access_token, 'tok-alice');
+
+    // 10. quick_connect_broker_enabled: false returns 403 qc_broker_rejected without calling Jellyfin
+    const callsBeforeCarol = authorizeCallCount;
+    const rCarol = await fetch(`${app.baseUrl}/api/v1/auth/authorize-quick-connect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Setup-Token': app.setupToken },
+      body: JSON.stringify({ serverId: 'srv-old-1', userId: 'cccccccc-dddd-eeee-ffff-000000000000', code: '123456' }),
+    });
+    assert.equal(rCarol.status, 403);
+    assert.equal((await rCarol.json()).error_code, 'qc_broker_rejected');
+    assert.equal(authorizeCallCount, callsBeforeCarol);
+
+    // 11. needs_relink: true returns 409 no_verified_user without calling Jellyfin
+    const callsBeforeDave = authorizeCallCount;
+    const rDave = await fetch(`${app.baseUrl}/api/v1/auth/authorize-quick-connect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Setup-Token': app.setupToken },
+      body: JSON.stringify({ serverId: 'srv-old-1', userId: 'dddddddd-eeee-ffff-0000-111111111111', code: '123456' }),
+    });
+    assert.equal(rDave.status, 409);
+    assert.equal((await rDave.json()).error_code, 'no_verified_user');
+    assert.equal(authorizeCallCount, callsBeforeDave);
   } finally {
     await app.close();
     await jf.close();

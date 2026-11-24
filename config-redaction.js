@@ -108,6 +108,7 @@ function redactConfigForExport(config) {
             u.has_verified_token = hasToken;
             u.access_token = hasToken ? SECRET_PLACEHOLDER : '';
             u.needs_relink = Boolean(u.needs_relink);
+            u.quick_connect_broker_enabled = u.quick_connect_broker_enabled !== false;
             if (u.musicAssistant && typeof u.musicAssistant === 'object') {
               u.musicAssistant = { ...u.musicAssistant };
               if (typeof u.musicAssistant.token === 'string' && u.musicAssistant.token.trim().length > 0) {

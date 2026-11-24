@@ -101,6 +101,7 @@ export const api = {
   quickConnectPoll:     (body)               => request('POST', '/api/admin/quick-connect/poll', body),
   quickConnectCancel:   (pendingId)          => request('POST', '/api/admin/quick-connect/cancel', { pendingId }),
   testJellyfin:      (body)                  => request('POST', '/api/admin/test-jellyfin', body),
+  serverQuickConnectStatus: (serverId)       => request('GET',  '/api/admin/servers/' + encodeURIComponent(serverId) + '/quick-connect-status'),
   testSeerr:         (body)                  => request('POST', '/api/admin/test-seerr', body),
 
   // Analytics

@@ -105,6 +105,7 @@ function collectVerifiedCandidates(config) {
     const users = Array.isArray(srv.users) ? srv.users : [];
     for (const u of users) {
       if (!u || !u.id) continue;
+      if (u.needs_relink === true) continue;
       if (u.has_verified_token || (u.access_token && u.access_token !== '***REDACTED***')) {
         list.push({
           key: `${srv.id}:${u.id}`,
@@ -112,6 +113,7 @@ function collectVerifiedCandidates(config) {
           serverName: srv.name || srv.id,
           userId: u.id,
           username: u.username || u.name || u.id,
+          quickConnectBrokerEnabled: u.quick_connect_broker_enabled !== false,
         });
       }
     }
@@ -152,6 +154,7 @@ export default function TvPairingModal({ config, onClose, onToast }) {
 
   // Done summary
   const [doneResult, setDoneResult] = useState(null);
+  const [qcStatus, setQcStatus] = useState(null); // { serverId, loading, enabled, reachable }
 
   // QR scan
   const [liveScan, setLiveScan] = useState(false);
@@ -187,6 +190,37 @@ export default function TvPairingModal({ config, onClose, onToast }) {
     if (step !== STEPS.scan) stopLiveScan();
     return stopLiveScan;
   }, [step]);
+
+  useEffect(() => {
+    if (step !== STEPS.confirm || !selectedTarget || selectedTarget === '__share_only__') {
+      setQcStatus(null);
+      return;
+    }
+    const chosen = candidates.find((cand) => cand.key === selectedTarget);
+    if (!chosen?.serverId) {
+      setQcStatus(null);
+      return;
+    }
+    let cancelled = false;
+    setQcStatus({ serverId: chosen.serverId, loading: true, enabled: null, reachable: null });
+    api.serverQuickConnectStatus(chosen.serverId)
+      .then((res) => {
+        if (cancelled) return;
+        setQcStatus({
+          serverId: chosen.serverId,
+          loading: false,
+          enabled: res?.enabled ?? null,
+          reachable: res?.reachable ?? null,
+        });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setQcStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [step, selectedTarget]);
 
   function onDecoded(text) {
     stopLiveScan();
@@ -587,6 +621,10 @@ export default function TvPairingModal({ config, onClose, onToast }) {
     );
   } else if (step === STEPS.confirm) {
     const c = confirm?.candidate || {};
+    const chosenCandidate =
+      selectedTarget && selectedTarget !== '__share_only__'
+        ? candidates.find((cand) => cand.key === selectedTarget) || null
+        : null;
     body = (
       <div className="col" style={{ gap: 12 }}>
         <div className="muted" style={{ fontSize: 12 }}>Confirm target device and send configuration:</div>
@@ -644,6 +682,18 @@ export default function TvPairingModal({ config, onClose, onToast }) {
             <option value="__share_only__">Network shares &amp; settings only (no Jellyfin server)</option>
           </select>
         </div>
+
+        {chosenCandidate && qcStatus && !qcStatus.loading && qcStatus.serverId === chosenCandidate.serverId && qcStatus.enabled === false && (
+          <div className="chip warn" role="status" aria-live="polite" style={{ alignSelf: 'stretch' }}>
+            <span className="dot"/> Quick Connect is disabled on {chosenCandidate.serverName}. The device will still receive server and settings, then prompt for username and password.
+          </div>
+        )}
+
+        {chosenCandidate && chosenCandidate.quickConnectBrokerEnabled === false && (
+          <div className="chip warn" role="status" aria-live="polite" style={{ alignSelf: 'stretch' }}>
+            <span className="dot"/> Quick Connect auto-approval is disabled for {chosenCandidate.username}. The device will prompt to sign in manually.
+          </div>
+        )}
 
         {hint?.isLikelyDockerBridge && (
           <div className="chip warn" role="status" aria-live="polite" style={{ alignSelf: 'stretch' }}>

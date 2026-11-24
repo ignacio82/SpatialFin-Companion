@@ -148,6 +148,22 @@ test('safe-fetch blocks non-canonical IPv4, syntactic loopback, self-SSRF, and v
     SsrfBlockedError
   );
 
+  // Docker bridge host LAN IP configured via COMPANION_HOST_IP blocks self-SSRF on selfPort while allowing Jellyfin port
+  const prevHostIp = process.env.COMPANION_HOST_IP;
+  process.env.COMPANION_HOST_IP = '192.168.1.90';
+  try {
+    assert.throws(
+      () => validateInitialUrl('http://192.168.1.90:1982/api/admin/config', POLICY_PUBLIC_OR_LAN, { selfPort: 1982 }),
+      SsrfBlockedError
+    );
+    assert.doesNotThrow(
+      () => validateInitialUrl('http://192.168.1.90:8096/System/Info/Public', POLICY_PUBLIC_OR_LAN, { selfPort: 1982 })
+    );
+  } finally {
+    if (prevHostIp === undefined) delete process.env.COMPANION_HOST_IP;
+    else process.env.COMPANION_HOST_IP = prevHostIp;
+  }
+
   // Multi-record DNS strips fe80::/10 and fails closed on prohibited record
   const lookupOk = createPinnedLookup({
     policy: POLICY_PRIVATE_LAN_ONLY,

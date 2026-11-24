@@ -586,6 +586,52 @@ function generatePendingId() {
   return crypto.randomBytes(16).toString('hex');
 }
 
+async function checkQuickConnectEnabled({
+  serverConfig,
+  safeHttpJson,
+  buildJellyfinAuthHeaders,
+  signal,
+  perAddressTimeoutMs = 2_500,
+}) {
+  const addresses = (Array.isArray(serverConfig?.addresses) ? serverConfig.addresses : [])
+    .map(normalizeUrl)
+    .filter(Boolean);
+  if (addresses.length === 0) {
+    return { enabled: null, reachable: false, errorCode: 'qc_broker_unreachable' };
+  }
+
+  try {
+    return await staggeredRace(
+      addresses,
+      async (baseUrl, branchSignal) => {
+        const res = await safeHttpJson(`${baseUrl}/QuickConnect/Enabled`, {
+          method: 'GET',
+          headers: buildJellyfinAuthHeaders(null),
+          maxRedirects: 0,
+          timeoutMs: perAddressTimeoutMs,
+          signal: branchSignal,
+        });
+        if (res.status === 200 && res.data === true) {
+          return { enabled: true, reachable: true };
+        }
+        if ((res.status === 200 && res.data === false) || res.status === 401 || res.status === 403) {
+          return { enabled: false, reachable: true };
+        }
+        throw createQcError('qc_broker_unreachable', `Unexpected HTTP ${res.status}`, 503);
+      },
+      { staggerMs: 150, perItemTimeoutMs: perAddressTimeoutMs, signal }
+    );
+  } catch (err) {
+    const errors = err instanceof AggregateError ? err.errors : [err];
+    for (const e of errors) {
+      if (e instanceof SsrfBlockedError) {
+        return { enabled: null, reachable: false, errorCode: 'ssrf_blocked' };
+      }
+    }
+    return { enabled: null, reachable: false, errorCode: 'qc_broker_unreachable' };
+  }
+}
+
 module.exports = {
   normalizeUuid,
   isCanonicalJellyfinServerId,
@@ -595,6 +641,7 @@ module.exports = {
   createQcError,
   staggeredRace,
   probePublicSystemInfo,
+  checkQuickConnectEnabled,
   initiateQuickConnect,
   pollQuickConnect,
   exchangeQuickConnect,

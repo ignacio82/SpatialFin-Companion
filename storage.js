@@ -975,6 +975,7 @@ function createStorage(options) {
         delete next.password;
         delete next.has_verified_token;
         next.needs_relink = Boolean(user.needs_relink);
+        next.quick_connect_broker_enabled = user.quick_connect_broker_enabled !== false;
 
         if (user.preferences && typeof user.preferences === 'object' && !Array.isArray(user.preferences)) {
           next.preferences = sanitizePreferenceMap(user.preferences, { preserveNull: false });
