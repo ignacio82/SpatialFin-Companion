@@ -2939,7 +2939,13 @@ function createCompanionApp(options = {}) {
     windowMs: 60 * 1000,
     limit: 20,
     skipSuccessfulRequests: true,
-    requestWasSuccessful: (_req, res) => res.statusCode !== 401,
+    // Legacy v2.7.70 FCastReceiverService posts /api/fcast/register every 30 s
+    // without headers; keep returning 401/403 via requireSetupTokenOrAdmin,
+    // but exempt bare unauthenticated register pings from exhausting the
+    // IP-shared /api/v1/config bucket under Docker bridge NAT.
+    requestWasSuccessful: (req, res) =>
+      res.statusCode !== 401 ||
+      (req.path === '/api/fcast/register' && req.headers['x-setup-token'] === undefined && !req.headers.cookie),
     store: new BoundedMemoryStore(4096),
     keyGenerator: ipKeyGen,
     validate: rateLimitValidate,
@@ -5752,6 +5758,8 @@ function createCompanionApp(options = {}) {
 
     const cloned = structuredClone(appConfig);
     delete cloned.instance_id;
+    cloned.version = Number(cloned.version) || 1;
+    cloned.setup_token = String(cloned.setup_token || '');
 
     // Enforce read-time Predicate 3 Seerr isolation when X-Companion-Device is present
     const seerrState = resolveEffectiveDevicePreferences(
@@ -5770,17 +5778,29 @@ function createCompanionApp(options = {}) {
           !isQcBroker && Array.isArray(srv.legacy_ids) && srv.legacy_ids.length > 0
             ? srv.legacy_ids[0]
             : srv.id;
+        const safeId = String(projectedId || srv.id || '');
+        const safeName =
+          typeof srv.name === 'string' && srv.name.length > 0
+            ? srv.name
+            : String(srv.name || projectedId || srv.id || 'Jellyfin Server');
+        const safeAddresses = Array.isArray(srv.addresses)
+          ? srv.addresses.filter((a) => typeof a === 'string' && a.trim().length > 0)
+          : [];
 
         const users = Array.isArray(srv.users)
           ? srv.users.map((user) => {
               if (!user || typeof user !== 'object') return user;
               const u = { ...user };
               delete u.password;
+              u.username =
+                typeof u.username === 'string' && u.username.length > 0
+                  ? u.username
+                  : String(u.name || u.id || 'user');
               const hasToken = typeof u.access_token === 'string' && u.access_token.trim().length > 0;
               const tokenUsable = hasToken && u.needs_relink !== true;
               u.has_verified_token = tokenUsable;
               u.quick_connect_broker_enabled = u.quick_connect_broker_enabled !== false;
-              if (isQcBroker || u.needs_relink === true) {
+              if (isQcBroker || !tokenUsable) {
                 delete u.access_token;
               }
               if (isWebXr && u.musicAssistant && typeof u.musicAssistant === 'object') {
@@ -5793,17 +5813,31 @@ function createCompanionApp(options = {}) {
               return u;
             })
           : [];
-        return { ...srv, id: projectedId, users };
+        return { ...srv, id: safeId, name: safeName, addresses: safeAddresses, users };
       });
+    } else {
+      cloned.servers = [];
     }
 
-    if (isWebXr && Array.isArray(cloned.networkShares)) {
-      cloned.networkShares = cloned.networkShares.map((sh) => {
-        if (!sh || typeof sh !== 'object') return sh;
-        const copy = { ...sh };
-        delete copy.password;
-        return copy;
-      });
+    if (Array.isArray(cloned.networkShares)) {
+      cloned.networkShares = cloned.networkShares
+        .filter((sh) => sh && typeof sh === 'object')
+        .map((sh, idx) => {
+          const protocol = typeof sh.protocol === 'string' && sh.protocol.trim() ? sh.protocol : 'smb';
+          const host = typeof sh.host === 'string' ? sh.host : String(sh.host || '');
+          const shareName = typeof sh.shareName === 'string' ? sh.shareName : String(sh.shareName || '');
+          const id =
+            typeof sh.id === 'string' && sh.id.trim().length > 0
+              ? sh.id
+              : `${protocol}-${host}-${shareName}-${idx}`;
+          const copy = { ...sh, id, protocol, host, shareName };
+          if (isWebXr) {
+            delete copy.password;
+          }
+          return copy;
+        });
+    } else {
+      cloned.networkShares = [];
     }
 
     return { payload: cloned, isQcBroker, deviceId };

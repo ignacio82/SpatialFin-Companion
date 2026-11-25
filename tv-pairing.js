@@ -316,6 +316,10 @@ function normalizeServerIdForMatch(id) {
 
 function buildTvPairingEnvelope(config, companionUrl, options = {}) {
   const clonedConfig = structuredClone(config || {});
+  delete clonedConfig.instance_id;
+  clonedConfig.version = Number(clonedConfig.version) || 1;
+  clonedConfig.setup_token = String(clonedConfig.setup_token || '');
+
   const shareOnly = Boolean(options.shareOnly);
   const requestedServerId = options.serverId ? String(options.serverId).trim() : null;
   const requestedUserId = options.userId ? String(options.userId).trim() : null;
@@ -342,6 +346,15 @@ function buildTvPairingEnvelope(config, companionUrl, options = {}) {
   projectedServers = projectedServers.map((srv) => {
     const legacyId = Array.isArray(srv.legacy_ids) && srv.legacy_ids.length > 0 ? srv.legacy_ids[0] : null;
     const projectedId = legacyId || srv.id;
+    const safeId = String(projectedId || srv.id || '');
+    const safeName =
+      typeof srv.name === 'string' && srv.name.length > 0
+        ? srv.name
+        : String(srv.name || projectedId || srv.id || 'Jellyfin Server');
+    const safeAddresses = Array.isArray(srv.addresses)
+      ? srv.addresses.filter((a) => typeof a === 'string' && a.trim().length > 0)
+      : [];
+
     if (requestedServerId) {
       const reqNorm = normalizeServerIdForMatch(requestedServerId);
       const matches =
@@ -350,7 +363,7 @@ function buildTvPairingEnvelope(config, companionUrl, options = {}) {
         (Array.isArray(srv.legacy_ids) &&
           srv.legacy_ids.some((lid) => lid === requestedServerId || normalizeServerIdForMatch(lid) === reqNorm));
       if (matches) {
-        remappedServerId = projectedId;
+        remappedServerId = safeId;
       }
     }
 
@@ -367,16 +380,39 @@ function buildTvPairingEnvelope(config, companionUrl, options = {}) {
 
     return {
       ...srv,
-      id: projectedId,
+      id: safeId,
+      name: safeName,
+      addresses: safeAddresses,
       users: users.map((u) => {
         const copy = { ...u };
         delete copy.password;
+        copy.username =
+          typeof copy.username === 'string' && copy.username.length > 0
+            ? copy.username
+            : String(copy.name || copy.id || 'user');
+        if (copy.needs_relink === true || typeof copy.access_token !== 'string' || !copy.access_token.trim()) {
+          delete copy.access_token;
+        }
         return copy;
       })
     };
   });
 
   clonedConfig.servers = projectedServers;
+  clonedConfig.networkShares = Array.isArray(clonedConfig.networkShares)
+    ? clonedConfig.networkShares
+        .filter((sh) => sh && typeof sh === 'object')
+        .map((sh, idx) => {
+          const protocol = typeof sh.protocol === 'string' && sh.protocol.trim() ? sh.protocol : 'smb';
+          const host = typeof sh.host === 'string' ? sh.host : String(sh.host || '');
+          const shareName = typeof sh.shareName === 'string' ? sh.shareName : String(sh.shareName || '');
+          const id =
+            typeof sh.id === 'string' && sh.id.trim().length > 0
+              ? sh.id
+              : `${protocol}-${host}-${shareName}-${idx}`;
+          return { ...sh, id, protocol, host, shareName };
+        })
+    : [];
 
   const envelope = {
     version: 1,
