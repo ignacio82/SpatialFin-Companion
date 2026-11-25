@@ -78,16 +78,35 @@ const SCREEN_META = {
 
 const VALID_SCREENS = Object.keys(SCREEN_META);
 
+function parseCompanionHash(rawHash) {
+  const cleaned = String(rawHash || '').replace(/^#/, '');
+  const qIndex = cleaned.indexOf('?');
+  const routePart = (qIndex >= 0 ? cleaned.slice(0, qIndex) : cleaned).trim().toLowerCase();
+  const queryPart = qIndex >= 0 ? cleaned.slice(qIndex + 1) : '';
+  const screen = VALID_SCREENS.includes(routePart) ? routePart : 'dashboard';
+  const params = {};
+  if (queryPart) {
+    const sp = new URLSearchParams(queryPart);
+    for (const [k, v] of sp.entries()) {
+      if (k && v) params[k] = v;
+    }
+  }
+  return { screen, params };
+}
+
 export default function App() {
   // checking | open | needs-bootstrap | needs-login | authed | host-rejected
   const [authState, setAuthState] = useState('checking');
   const [bootstrapMeta, setBootstrapMeta] = useState({ canBootstrapWithPin: false, bootstrapPinExpiresAt: null });
   const [meta, setMeta] = useState(null);
   const [config, setConfig] = useState(null);
-  const [screen, setScreen] = useState(() => {
-    const hash = window.location.hash.slice(1);
-    return VALID_SCREENS.includes(hash) ? hash : 'dashboard';
-  });
+  const [initialRoute] = useState(() => parseCompanionHash(window.location.hash));
+  const [screen, setScreen] = useState(initialRoute.screen);
+  const [deepLink, setDeepLink] = useState(() =>
+    Object.keys(initialRoute.params).length > 0
+      ? { screen: initialRoute.screen, params: initialRoute.params, id: Date.now() }
+      : null
+  );
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [cmdOpen, setCmdOpen] = useState(false);
   const [rotateConfirmOpen, setRotateConfirmOpen] = useState(false);
@@ -143,13 +162,19 @@ export default function App() {
   useWebSocketEvent('config_changed', () => reloadConfig());
 
   useEffect(() => {
-    window.location.hash = screen;
-  }, [screen]);
+    if (deepLink && deepLink.screen === screen) return;
+    if (window.location.hash !== `#${screen}`) {
+      window.location.hash = screen;
+    }
+  }, [screen, deepLink]);
 
   useEffect(() => {
     const onHash = () => {
-      const hash = window.location.hash.slice(1);
-      if (VALID_SCREENS.includes(hash)) setScreen(hash);
+      const parsed = parseCompanionHash(window.location.hash);
+      setScreen(parsed.screen);
+      if (Object.keys(parsed.params).length > 0) {
+        setDeepLink({ screen: parsed.screen, params: parsed.params, id: Date.now() });
+      }
     };
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
@@ -169,7 +194,17 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
+  const consumeDeepLink = useCallback(() => {
+    setDeepLink(null);
+    try {
+      if (window.location.hash.includes('?')) {
+        window.history.replaceState(null, '', `#${screen}`);
+      }
+    } catch (_) {}
+  }, [screen]);
+
   const navigate = useCallback((id) => {
+    setDeepLink(null);
     setScreen(id);
     setSidebarOpen(false);
     setCmdOpen(false);
@@ -228,6 +263,8 @@ export default function App() {
     onNavigate: navigate,
     onToast,
     onRequestRotateToken: requestRotateToken,
+    deepLink: deepLink && deepLink.screen === screen ? deepLink : null,
+    onConsumeDeepLink: consumeDeepLink,
   };
 
   const cmdActions = useMemo(() => [

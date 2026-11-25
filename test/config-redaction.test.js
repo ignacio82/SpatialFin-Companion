@@ -74,6 +74,21 @@ test('redactConfigForExport masks secrets across all 3 pref maps and strips setu
   assert.equal(out.servers[0].users[0].musicAssistant.password, SECRET_PLACEHOLDER);
   assert.equal(out.servers[0].users[0].preferences.pref_voice_assistant_cloud_api_key, SECRET_PLACEHOLDER);
   assert.equal(out.networkShares[0].password, SECRET_PLACEHOLDER);
+
+  // Users marked needs_relink: true preserve SECRET_PLACEHOLDER for reconcile, but report has_verified_token: false
+  const rawRelink = {
+    servers: [
+      {
+        id: 'srv-1',
+        addresses: ['http://192.168.1.20:8096'],
+        users: [{ id: 'u-relink', username: 'bob', access_token: 'stale-tok', needs_relink: true }],
+      },
+    ],
+  };
+  const outRelink = redactConfigForExport(rawRelink);
+  assert.equal(outRelink.servers[0].users[0].has_verified_token, false);
+  assert.equal(outRelink.servers[0].users[0].needs_relink, true);
+  assert.equal(outRelink.servers[0].users[0].access_token, SECRET_PLACEHOLDER);
 });
 
 test('scrubApiKeyFromText redacts api_key and apikey query parameters', () => {

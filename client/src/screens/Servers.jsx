@@ -8,7 +8,7 @@ import { hashColor } from '../format.js';
 
 const primaryAddress = (srv) => (Array.isArray(srv?.addresses) ? srv.addresses[0] : null) || '';
 const isVerifiedUser = (u) =>
-  Boolean(u && (u.has_verified_token || (u.access_token && u.access_token !== '***REDACTED***')));
+  Boolean(u && !u.needs_relink && (u.has_verified_token || (u.access_token && u.access_token !== '***REDACTED***')));
 
 const LANG_OPTIONS = [
   { value: '',    label: '(Inherit Global)' },
@@ -23,7 +23,7 @@ const LANG_OPTIONS = [
   { value: 'chi', label: 'Chinese' },
 ];
 
-export default function Servers({ config, reloadConfig, onToast }) {
+export default function Servers({ config, reloadConfig, onToast, deepLink, onConsumeDeepLink }) {
   const servers = Array.isArray(config?.servers) ? config.servers : [];
   const [adding, setAdding] = useState(false);
   const [addBaseVersion, setAddBaseVersion] = useState(null);
@@ -33,7 +33,52 @@ export default function Servers({ config, reloadConfig, onToast }) {
   const [testResult, setTestResult] = useState(null);
   const [conflict, setConflict] = useState(false);
   const [dropConfirm, setDropConfirm] = useState(null); // { retry: () => Promise<boolean>, onCancel?: () => void, unmatched: string[] }
-  const [qcModal, setQcModal] = useState(null); // { serverId, serverName, mode: 'link' | 'add_address', initialUrl?: string }
+  const [qcModal, setQcModal] = useState(null); // { serverId, serverName, mode: 'link' | 'add_address', initialUrl?: string, targetUser?: string | null }
+  const [deepLinkExpand, setDeepLinkExpand] = useState(null); // { serverId, username, id }
+
+  useEffect(() => {
+    if (!deepLink || !config) return;
+    const normId = (v) => String(v || '').trim().toLowerCase().replace(/-/g, '');
+    const targetServerNorm = normId(deepLink.params?.serverId);
+    const targetUser = String(deepLink.params?.user || '').trim();
+    const action = String(deepLink.params?.action || '').trim().toLowerCase();
+
+    let matchedServer = null;
+    if (targetServerNorm) {
+      matchedServer = servers.find(
+        (s) =>
+          normId(s?.id) === targetServerNorm ||
+          (Array.isArray(s?.legacy_ids) && s.legacy_ids.some((lid) => normId(lid) === targetServerNorm))
+      ) || null;
+    }
+    if (!matchedServer && targetUser) {
+      matchedServer = servers.find((s) =>
+        Array.isArray(s?.users) &&
+        s.users.some((u) => String(u?.username || u?.name || '').trim().toLowerCase() === targetUser.toLowerCase())
+      ) || null;
+    }
+    if (!matchedServer && servers.length === 1) {
+      matchedServer = servers[0];
+    }
+
+    onConsumeDeepLink?.();
+
+    if (!matchedServer) return;
+    if (action === 'relink') {
+      setQcModal({
+        serverId: matchedServer.id,
+        serverName: matchedServer.name || matchedServer.id,
+        mode: 'link',
+        targetUser: targetUser || null,
+      });
+    } else if (action === 'overrides' && targetUser) {
+      setDeepLinkExpand({
+        serverId: matchedServer.id,
+        username: targetUser,
+        id: deepLink.id || Date.now(),
+      });
+    }
+  }, [deepLink, config, servers, onConsumeDeepLink]);
 
   async function testNew() {
     setBusy(true);
@@ -273,6 +318,10 @@ export default function Servers({ config, reloadConfig, onToast }) {
     (acc, s) => acc + (Array.isArray(s.users) ? s.users.filter(isVerifiedUser).length : 0),
     0
   );
+  const needsRelinkCount = servers.reduce(
+    (acc, s) => acc + (Array.isArray(s.users) ? s.users.filter((u) => u && u.needs_relink).length : 0),
+    0
+  );
 
   return (
     <div className="col" style={{ gap: 14 }} data-screen-label="06 Servers and Users">
@@ -289,6 +338,9 @@ export default function Servers({ config, reloadConfig, onToast }) {
         <div className="row" style={{ gap: 12 }}>
           <span className="chip">{servers.length} servers</span>
           <span className="chip">{verifiedUserCount} verified users</span>
+          {needsRelinkCount > 0 && (
+            <span className="chip err"><span className="dot"/> {needsRelinkCount} need re-link</span>
+          )}
         </div>
         <button
           type="button"
@@ -357,6 +409,7 @@ export default function Servers({ config, reloadConfig, onToast }) {
           onQuickConnectAddAddress={() => setQcModal({ serverId: srv.id, serverName: srv.name || srv.id, mode: 'add_address' })}
           onUnlinkUser={(user) => unlinkUser(srv, user)}
           onRemoveUser={(username) => removeUser(srv, username)}
+          deepLinkExpand={deepLinkExpand && deepLinkExpand.serverId === srv.id ? deepLinkExpand : null}
           busy={busy}
         />
       ))}
@@ -366,6 +419,7 @@ export default function Servers({ config, reloadConfig, onToast }) {
           serverId={qcModal.serverId}
           serverName={qcModal.serverName}
           mode={qcModal.mode}
+          targetUser={qcModal.targetUser || null}
           onClose={() => setQcModal(null)}
           onLinked={async (username) => {
             setQcModal(null);
@@ -436,7 +490,7 @@ function formatSpacedCode(code) {
   return digits;
 }
 
-function QuickConnectLinkModal({ serverId, serverName, mode, onClose, onLinked, onRequestDropConfirm, onToast }) {
+function QuickConnectLinkModal({ serverId, serverName, mode, targetUser = null, onClose, onLinked, onRequestDropConfirm, onToast }) {
   const [serverUrl, setServerUrl] = useState('');
   const [pending, setPending] = useState(null); // { pendingId, code, expiresAt }
   const [statusText, setStatusText] = useState(
@@ -607,6 +661,11 @@ function QuickConnectLinkModal({ serverId, serverName, mode, onClose, onLinked, 
       }
     >
       <div className="col" style={{ gap: 12 }}>
+        {mode === 'link' && targetUser && (
+          <div className="chip" style={{ alignSelf: 'stretch', justifyContent: 'flex-start' }}>
+            Re-linking <strong>{targetUser}</strong> — approve this code while signed into Jellyfin as {targetUser}.
+          </div>
+        )}
         {mode === 'add_address' && !pending && (
           <div className="col" style={{ gap: 6 }}>
             <label className="eyebrow" htmlFor="qc-new-server-url">New Server URL</label>
@@ -665,6 +724,7 @@ function ServerCard({
   onQuickConnectAddAddress,
   onUnlinkUser,
   onRemoveUser,
+  deepLinkExpand = null,
   busy,
 }) {
   const [open, setOpen] = useState(true);
@@ -675,9 +735,24 @@ function ServerCard({
   const [u, setU] = useState('');
   const [p, setP] = useState('');
   const [expandedUser, setExpandedUser] = useState(null);
+  const handledExpandIdRef = useRef(null);
   const url = primaryAddress(srv);
   const users = Array.isArray(srv.users) ? srv.users : [];
   const status = srv.status || (srv.online === false ? 'offline' : 'online');
+
+  useEffect(() => {
+    if (!deepLinkExpand || !deepLinkExpand.username) return;
+    if (handledExpandIdRef.current === deepLinkExpand.id) return;
+    handledExpandIdRef.current = deepLinkExpand.id;
+    setOpen(true);
+    const target = String(deepLinkExpand.username).trim().toLowerCase();
+    const matched = users.find(
+      (usr) => usr && String(usr.username || usr.name || '').trim().toLowerCase() === target
+    );
+    if (matched) {
+      setExpandedUser(matched.id || matched.username || matched.name);
+    }
+  }, [deepLinkExpand, users]);
 
   async function submit(e) {
     e?.preventDefault?.();
@@ -855,7 +930,7 @@ function ServerCard({
                         )}
                       </div>
                       <div className="row" style={{ gap: 4 }}>
-                        {verified && (
+                        {(verified || user.needs_relink) && (
                           <button type="button" className="btn ghost sm" onClick={() => onUnlinkUser(user)} disabled={busy}>
                             Unlink
                           </button>

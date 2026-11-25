@@ -255,11 +255,14 @@ test('buildTvPairingError maps pairing_cancelled and pairing_token_invalid clean
 test('buildJellyfinAuthHeadersForInstance omits X-Emby-Token and Token when blank', () => {
   const unauthed = buildJellyfinAuthHeadersForInstance('abcd1234abcd1234', null);
   assert.equal(unauthed['X-Emby-Token'], undefined);
+  assert.match(unauthed.Authorization, /DeviceId="spatialfin-companion-abcd1234abcd1234"/);
+  assert.doesNotMatch(unauthed.Authorization, /Token=/);
   assert.match(unauthed['X-Emby-Authorization'], /DeviceId="spatialfin-companion-abcd1234abcd1234"/);
   assert.doesNotMatch(unauthed['X-Emby-Authorization'], /Token=/);
 
   const authed = buildJellyfinAuthHeadersForInstance('abcd1234abcd1234', 'tok-xyz');
   assert.equal(authed['X-Emby-Token'], 'tok-xyz');
+  assert.match(authed.Authorization, /Token="tok-xyz"/);
   assert.match(authed['X-Emby-Authorization'], /Token="tok-xyz"/);
 });
 

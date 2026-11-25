@@ -105,9 +105,10 @@ function redactConfigForExport(config) {
             const u = { ...user };
             delete u.password;
             const hasToken = typeof u.access_token === 'string' && u.access_token.trim().length > 0;
-            u.has_verified_token = hasToken;
+            const needsRelink = Boolean(u.needs_relink);
+            u.has_verified_token = hasToken && !needsRelink;
             u.access_token = hasToken ? SECRET_PLACEHOLDER : '';
-            u.needs_relink = Boolean(u.needs_relink);
+            u.needs_relink = needsRelink;
             u.quick_connect_broker_enabled = u.quick_connect_broker_enabled !== false;
             if (u.musicAssistant && typeof u.musicAssistant === 'object') {
               u.musicAssistant = { ...u.musicAssistant };

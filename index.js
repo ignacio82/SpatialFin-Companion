@@ -367,10 +367,12 @@ function buildJellyfinAuthHeadersForInstance(instanceId, accessToken) {
   const baseAuth = `MediaBrowser Client="SpatialFin Companion", Device="Server", DeviceId="${deviceId}", Version="${APP_VERSION || '1.0.0'}"`;
   if (!token) {
     return {
+      Authorization: baseAuth,
       'X-Emby-Authorization': baseAuth,
     };
   }
   return {
+    Authorization: `${baseAuth}, Token="${token}"`,
     'X-Emby-Token': token,
     'X-Emby-Authorization': `${baseAuth}, Token="${token}"`,
   };
@@ -1015,7 +1017,10 @@ function createCompanionApp(options = {}) {
   }
 
   function broadcastConfigChanged(deviceId = null) {
-    broadcastAdminEvent({ type: 'config_changed', deviceId }, { includeSetupTokenClients: true });
+    broadcastAdminEvent(
+      { type: 'config_changed', deviceId, targetDeviceId: deviceId },
+      { includeSetupTokenClients: true }
+    );
   }
 
   function revokeSetupTokenWebSockets() {
@@ -1169,7 +1174,7 @@ function createCompanionApp(options = {}) {
   function findVerifiedUserForServer(serverId, preferredUserId, preferredUsername) {
     const server = findConfigServerById(serverId);
     if (!server || !Array.isArray(server.users)) return { server: null, user: null };
-    const candidates = server.users.filter((user) => user && user.access_token);
+    const candidates = server.users.filter((user) => user && user.access_token && user.needs_relink !== true);
     const exact = candidates.find(
       (user) =>
         (preferredUserId && user.id && normalizeId(user.id) === normalizeId(preferredUserId)) ||

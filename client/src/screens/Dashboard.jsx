@@ -72,7 +72,7 @@ export default function Dashboard({ config, version, onNavigate, onToast, onRequ
     (acc, s) =>
       acc +
       (Array.isArray(s.users)
-        ? s.users.filter((u) => u && Boolean(u.has_verified_token || (u.access_token && u.access_token !== '***REDACTED***'))).length
+        ? s.users.filter((u) => u && !u.needs_relink && Boolean(u.has_verified_token || (u.access_token && u.access_token !== '***REDACTED***'))).length
         : 0),
     0
   );
